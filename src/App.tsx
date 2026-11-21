@@ -140,7 +140,7 @@ export default function App() {
 
   // GAS Generator Config State
   const [gasSpreadsheetId, setGasSpreadsheetId] = useState('YOUR_SPREADSHEET_ID_HERE');
-  const [gasSheetName, setGasSheetName] = useState('Raw_Inquiries');
+  const [gasSheetName, setGasSheetName] = useState('DJ Client Base');
   const [gasDeduplicate, setGasDeduplicate] = useState(true);
   const [copiedCode, setCopiedCode] = useState(false);
 
@@ -590,11 +590,11 @@ export default function App() {
 
   const generatedGasCode = `/**
  * Google Apps Script Maintained Receiver & Source of Truth for WhatsApp Inquiries
- * Fail-closed authentication with distinct read, write, and migration credentials.
+ * Worksheet: DJ Client Base ("MP Ads Spend vs Revenue vs Client Inquiries")
  */
 
 const SPREADSHEET_ID = "${gasSpreadsheetId}";
-const SHEET_NAME = "${gasSheetName}";
+const SHEET_NAME = "DJ Client Base";
 const DEDUPLICATE_SAME_DAY = ${gasDeduplicate};
 const SUPPORTED_STATUSES = ["New", "In Progress", "Qualified", "Closed", "Lost"];
 
@@ -641,28 +641,28 @@ function handleRead() {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
   const sheet = ss.getSheetByName(SHEET_NAME);
   if (!sheet) {
-    return createJsonResponse({ status: "error", code: "SHEET_NOT_FOUND", message: "Raw_Inquiries sheet not found." });
+    return createJsonResponse({ status: "error", code: "SHEET_NOT_FOUND", message: '"DJ Client Base" sheet not found.' });
   }
 
   const data = sheet.getDataRange().getValues();
-  if (data.length <= 1) {
+  if (data.length <= 2) {
     return createJsonResponse({ status: "success", data: [] });
   }
 
   const rows = [];
-  for (let i = 1; i < data.length; i++) {
+  // Row 1 is legend, Row 2 is headers, data begins at row 3 (index 2)
+  for (let i = 2; i < data.length; i++) {
     const row = data[i];
-    if (!row[0] && !row[4]) continue;
+    if (!row[1] && !row[3]) continue;
     rows.push({
-      date: String(row[0] instanceof Date ? Utilities.formatDate(row[0], "Asia/Kuala_Lumpur", "yyyy-MM-dd") : row[0]),
-      timestamp: String(row[1] || ""),
-      inquiryId: String(row[2] || "").replace(/^'/, ""),
-      customerName: String(row[3] || "").replace(/^'/, ""),
-      phoneNumber: String(row[4] || "").replace(/^'/, ""),
-      sourceCampaign: String(row[5] || "").replace(/^'/, ""),
-      messageSummary: String(row[6] || "").replace(/^'/, ""),
-      agentAssigned: String(row[7] || "").replace(/^'/, ""),
-      status: String(row[8] || "New")
+      date: String(row[1] instanceof Date ? Utilities.formatDate(row[1], "Asia/Kuala_Lumpur", "yyyy-MM-dd") : row[1]),
+      customerName: String(row[2] || "").replace(/^'/, ""),
+      phoneNumber: String(row[3] || "").replace(/^'/, ""),
+      gender: String(row[4] || "Unknown"),
+      ageGroup: String(row[5] || ""),
+      state: String(row[6] || ""),
+      messageSummary: String(row[7] || "").replace(/^'/, ""),
+      status: "New"
     });
   }
 
@@ -680,80 +680,66 @@ function handleWrite(payload) {
     const sheet = ss.getSheetByName(SHEET_NAME);
     
     if (!sheet) {
-      return createJsonResponse({ status: "error", code: "SHEET_NOT_FOUND", message: "Raw_Inquiries sheet not found." });
+      return createJsonResponse({ status: "error", code: "SHEET_NOT_FOUND", message: '"DJ Client Base" sheet not found.' });
     }
 
     const now = new Date();
     const timezone = "Asia/Kuala_Lumpur";
     const dateStr = Utilities.formatDate(now, timezone, "yyyy-MM-dd");
-    const timestampStr = Utilities.formatDate(now, timezone, "yyyy-MM-dd HH:mm:ss");
+    const timeStr = Utilities.formatDate(now, timezone, "HH:mm");
 
-    const inquiryId = payload.id || payload.message_id || Utilities.getUuid();
-    const customerName = String(payload.contact?.name || payload.name || payload.contact?.full_name || payload.customer?.full_name || "Unknown");
-    const rawPhone = String(payload.contact?.phone || payload.phone || payload.sender?.phone || payload.customer?.phone || "");
-    const phoneNumber = rawPhone.replace(/[^0-9+]/g, "");
+    const customerName = String(payload.customerName || payload.name || "Unknown");
+    const rawPhone = String(payload.phoneNumber || payload.phone || "");
+    const phoneNumber = rawPhone.trim();
     
     if (!phoneNumber) {
-      return createJsonResponse({ status: "error", code: "INVALID_INPUT", message: "Validation error: Missing required phone number." });
+      return createJsonResponse({ status: "error", code: "INVALID_INPUT", message: "Validation error: Missing required phone number or username." });
     }
 
-    const sourceCampaign = String(payload.source || payload.utm_campaign || payload.campaign_name || "Organic / Direct");
-    
-    const hasMessage = payload.text !== undefined || payload.message !== undefined || payload.body !== undefined || payload.content !== undefined;
-    const messageSummary = hasMessage ? String(payload.text || payload.message || payload.body || payload.content || "") : null;
-
-    const hasAgent = payload.assignee !== undefined || payload.agent?.name !== undefined;
-    const agentAssigned = hasAgent ? String(payload.assignee || payload.agent?.name || "Unassigned") : null;
-
-    let status = payload.status !== undefined ? String(payload.status) : null;
-    if (status !== null) {
-      if (!SUPPORTED_STATUSES.includes(status)) {
-        return createJsonResponse({ status: "error", code: "INVALID_STATUS", message: "Unsupported status value." });
-      }
-    }
+    const gender = String(payload.gender || "Unknown");
+    const ageGroup = String(payload.ageGroup || "");
+    const state = String(payload.state || "");
+    const newRemark = String(payload.messageSummary || payload.text || payload.message || "");
 
     const safeText = function(val) {
       if (val === null || val === undefined) return "";
       const s = String(val);
-      if (s.startsWith("=") || s.startsWith("+") || (s.startsWith("0") && s.length > 1)) {
+      if (s.startsWith("=") || s.startsWith("+") || (s.startsWith("0") && s.length > 1) || s.startsWith("@")) {
         return "'" + s;
       }
       return s;
     };
 
     if (DEDUPLICATE_SAME_DAY && phoneNumber) {
-      const existingRowIndex = findRowByDateAndPhone(sheet, dateStr, phoneNumber, timezone);
+      const existingRowIndex = findRowByPhone(sheet, phoneNumber, timezone);
       if (existingRowIndex > 0) {
-        const existingMessage = sheet.getRange(existingRowIndex, 7).getValue();
-        const existingAgent = sheet.getRange(existingRowIndex, 8).getValue();
-        const existingStatus = sheet.getRange(existingRowIndex, 9).getValue();
+        const existingRemark = String(sheet.getRange(existingRowIndex, 8).getValue() || "");
+        const dateFormatted = dateStr.split("-").reverse().join("/");
+        const formattedNewRemark = newRemark ? "[" + dateFormatted + " " + timeStr + "] " + newRemark : "";
         
-        sheet.getRange(existingRowIndex, 2).setValue(timestampStr);
-        if (messageSummary !== null) {
-          sheet.getRange(existingRowIndex, 7).setValue(safeText(messageSummary));
+        let updatedRemark = existingRemark;
+        if (formattedNewRemark && !existingRemark.includes(newRemark)) {
+          updatedRemark = existingRemark ? existingRemark + "\\n" + formattedNewRemark : formattedNewRemark;
         }
-        if (agentAssigned !== null) {
-          sheet.getRange(existingRowIndex, 8).setValue(safeText(agentAssigned));
-        }
-        if (status !== null) {
-          sheet.getRange(existingRowIndex, 9).setValue(safeText(status));
-        }
-        
+
+        sheet.getRange(existingRowIndex, 8).setValue(safeText(updatedRemark));
         SpreadsheetApp.flush();
         return createJsonResponse({ status: "updated", action: "updated", row: existingRowIndex });
       }
     }
 
+    const dateFormattedInit = dateStr.split("-").reverse().join("/");
+    const initialRemark = newRemark ? "[" + dateFormattedInit + " " + timeStr + "] " + newRemark : "";
+
     sheet.appendRow([
+      "",
       dateStr,
-      timestampStr,
-      safeText(inquiryId),
       safeText(customerName),
       safeText(phoneNumber),
-      safeText(sourceCampaign),
-      safeText(messageSummary !== null ? messageSummary : ""),
-      safeText(agentAssigned !== null ? agentAssigned : "Unassigned"),
-      safeText(status !== null ? status : "New")
+      safeText(gender),
+      safeText(ageGroup),
+      safeText(state),
+      safeText(initialRemark)
     ]);
 
     SpreadsheetApp.flush();
@@ -783,21 +769,15 @@ function handleMigration(payload) {
     const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
     const sheet = ss.getSheetByName(SHEET_NAME);
     if (!sheet) {
-      return createJsonResponse({ status: "error", code: "SHEET_NOT_FOUND", message: "Raw_Inquiries sheet not found." });
+      return createJsonResponse({ status: "error", code: "SHEET_NOT_FOUND", message: '"DJ Client Base" sheet not found.' });
     }
 
     const data = sheet.getDataRange().getValues();
-    const existingRows = new Set();
-    const existingIds = new Set();
+    const existingPhones = new Set();
 
-    for (let i = 1; i < data.length; i++) {
-      const rDate = String(data[i][0] instanceof Date ? Utilities.formatDate(data[i][0], "Asia/Kuala_Lumpur", "yyyy-MM-dd") : data[i][0]);
-      const rId = String(data[i][2] || "").replace(/^'/, "");
-      const rPhone = String(data[i][4] || "").replace(/^'/, "");
-      if (rId) existingIds.add(rId);
-      if (rDate && rPhone) {
-        existingRows.add(rDate + "|" + rPhone);
-      }
+    for (let i = 2; i < data.length; i++) {
+      const rPhone = String(data[i][3] || "").replace(/^'/, "").trim();
+      if (rPhone) existingPhones.add(rPhone);
     }
 
     let wouldImport = 0;
@@ -806,57 +786,49 @@ function handleMigration(payload) {
     let conflicted = 0;
     let failed = 0;
 
-    const inputSeen = new Set();
     const rowsToAppend = [];
 
     for (const rec of records) {
       try {
         const rDate = String(rec.date || "").trim();
-        const rTimestamp = String(rec.timestamp || "").trim();
-        const rId = String(rec.inquiryId || rec.id || "").trim();
         const rName = String(rec.customerName || rec.name || "Unknown").trim();
-        const rPhone = String(rec.phoneNumber || rec.phone || "").replace(/[^0-9+]/g, "");
-        const rCampaign = String(rec.sourceCampaign || rec.source || "Organic / Direct").trim();
-        const rMessage = String(rec.messageSummary || rec.text || rec.message || "").trim();
-        const rAgent = String(rec.agentAssigned || rec.assignee || "Unassigned").trim();
-        const rStatus = String(rec.status || "New").trim();
+        const rPhone = String(rec.phoneNumber || rec.phone || "").trim();
+        const rGender = String(rec.gender || "Unknown").trim();
+        const rAge = String(rec.ageGroup || "").trim();
+        const rState = String(rec.state || "").trim();
+        const rRemark = String(rec.messageSummary || rec.text || "").trim();
 
         if (!rDate || !rPhone) {
           failed++;
           continue;
         }
 
-        const inputKey = rDate + "|" + rPhone;
-        const uniqueKey = rId ? rId : inputKey;
-
-        if (inputSeen.has(uniqueKey) || existingIds.has(rId) || existingRows.has(inputKey)) {
+        if (existingPhones.has(rPhone)) {
           skipped++;
           continue;
         }
 
-        inputSeen.add(uniqueKey);
         wouldImport++;
 
         if (!dryRun) {
           const safeText = function(val) {
             if (val === null || val === undefined) return "";
             const s = String(val);
-            if (s.startsWith("=") || s.startsWith("+") || (s.startsWith("0") && s.length > 1)) {
+            if (s.startsWith("=") || s.startsWith("+") || (s.startsWith("0") && s.length > 1) || s.startsWith("@")) {
               return "'" + s;
             }
             return s;
           };
 
           rowsToAppend.push([
+            "",
             rDate,
-            rTimestamp || rDate + " 00:00:00",
-            safeText(rId),
             safeText(rName),
             safeText(rPhone),
-            safeText(rCampaign),
-            safeText(rMessage),
-            safeText(rAgent),
-            safeText(rStatus)
+            safeText(rGender),
+            safeText(rAge),
+            safeText(rState),
+            safeText(rRemark)
           ]);
           imported++;
         }
@@ -888,15 +860,11 @@ function handleMigration(payload) {
   }
 }
 
-function findRowByDateAndPhone(sheet, dateStr, phoneNumber, timezone) {
+function findRowByPhone(sheet, phoneNumber, timezone) {
   const data = sheet.getDataRange().getValues();
-  for (let i = 1; i < data.length; i++) {
-    const rowDate = data[i][0] instanceof Date 
-      ? Utilities.formatDate(data[i][0], timezone, "yyyy-MM-dd")
-      : String(data[i][0]);
-    const rowPhone = String(data[i][4]).replace(/^'/, "");
-    
-    if (rowDate === dateStr && rowPhone === phoneNumber) {
+  for (let i = 2; i < data.length; i++) {
+    const rowPhone = String(data[i][3] || "").replace(/^'/, "").trim();
+    if (rowPhone === phoneNumber.trim()) {
       return i + 1;
     }
   }

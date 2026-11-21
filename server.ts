@@ -7,6 +7,7 @@ import crypto from 'crypto';
 import nodemailer from 'nodemailer';
 import cookieParser from 'cookie-parser';
 import Database from 'better-sqlite3';
+import * as XLSX from 'xlsx';
 import { GoogleGenAI } from '@google/genai';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -108,36 +109,48 @@ interface InquiryRecord {
   timestamp: string;
   inquiryId: string;
   customerName: string;
-  phoneNumber: string;
-  sourceCampaign: string;
-  messageSummary: string;
-  agentAssigned: string;
-  status: 'New' | 'In Progress' | 'Qualified' | 'Closed' | 'Lost';
+  phoneNumber: string; // Whatsapp / Username
+  gender?: string;
+  ageGroup?: string;
+  state?: string;
+  sourceCampaign?: string;
+  messageSummary: string; // Status / Remark
+  agentAssigned?: string;
+  status: string;
+  progress?: string;
 }
 
-// In-memory demo inquiries for sandbox
+// In-memory demo inquiries matching DJ Client Base layout
 let demoInquiries: InquiryRecord[] = [
   {
     date: new Date().toISOString().split('T')[0],
     timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
     inquiryId: 'WH-88392',
-    customerName: 'Sarah Jenkins',
-    phoneNumber: '+15552348901',
+    customerName: 'Sarah Jenkins (陳美玲)',
+    phoneNumber: '+60123456789',
+    gender: 'F',
+    ageGroup: '26-35',
+    state: 'Selangor',
     sourceCampaign: 'Meta_FB_Promo_Nov',
-    messageSummary: 'Inquired about pricing and availability for the enterprise tier.',
+    messageSummary: '[21/11/26 10:30] Inquired about pricing and availability for enterprise tier.\n[21/11/26 14:15] Followed up via WhatsApp call. Interested.',
     agentAssigned: 'employee1@djoyplus.com',
-    status: 'Qualified'
+    status: 'Qualified',
+    progress: '75%'
   },
   {
     date: new Date().toISOString().split('T')[0],
     timestamp: new Date(Date.now() - 3600000 * 2).toISOString().replace('T', ' ').substring(0, 19),
     inquiryId: 'WH-88391',
     customerName: 'Marcus Vance',
-    phoneNumber: '+15559876543',
+    phoneNumber: '@marcus_v_2026',
+    gender: 'M',
+    ageGroup: '36-45',
+    state: 'Kuala Lumpur',
     sourceCampaign: 'Google_Search_Brand',
-    messageSummary: 'Asked for onboarding documentation and setup guide.',
+    messageSummary: '[21/11/26 09:00] Asked for onboarding documentation.',
     agentAssigned: 'employee2@djoyplus.com',
-    status: 'Closed'
+    status: 'Closed',
+    progress: '100%'
   }
 ];
 
@@ -153,18 +166,15 @@ function verifyPassword(password: string, hash: string, salt: string): boolean {
   return crypto.timingSafeEqual(Buffer.from(passwordHash, 'hex'), Buffer.from(hash, 'hex'));
 }
 
-// Password validation rule: exactly 6 alphanumeric characters, including at least one letter and one number
 function isValidPassword(password: string): boolean {
   const regex = /^(?=.*[a-zA-Z])(?=.*\d)[a-zA-Z0-9]{6}$/;
   return regex.test(password);
 }
 
-// Email normalization
 function normalizeEmail(email: string): string {
   return (email || '').trim().toLowerCase();
 }
 
-// Email Transporter setup (Requirement 2: No silent fallback to local file)
 function getEmailTransporter() {
   const host = process.env.SMTP_HOST;
   const port = parseInt(process.env.SMTP_PORT || '587', 10);
@@ -197,7 +207,6 @@ async function sendTransactionalEmail(to: string, subject: string, text: string)
   });
 }
 
-// Rate limiting helper
 const rateLimitMap = new Map<string, number[]>();
 function checkRateLimit(key: string, limit: number, windowMs: number): boolean {
   const now = Date.now();
@@ -212,7 +221,6 @@ function checkRateLimit(key: string, limit: number, windowMs: number): boolean {
   return true;
 }
 
-// Session authentication middleware with CSRF protection
 const requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const sessionId = req.cookies?.sessionId || req.headers['x-session-token'];
   
@@ -227,7 +235,6 @@ const requireAuth = (req: express.Request, res: express.Response, next: express.
     return res.status(401).json({ success: false, error: 'Session expired or invalid.' });
   }
 
-  // CSRF protection for state-changing routes
   if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method)) {
     const clientCsrf = req.headers['x-csrf-token'];
     if (!clientCsrf || clientCsrf !== session.csrf_token) {
@@ -271,7 +278,6 @@ const requireManagerOrAdmin = (req: express.Request, res: express.Response, next
   next();
 };
 
-// CRM Webhook Secret Verification Middleware
 const verifyWebhookSecret = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET;
   if (!webhookSecret || webhookSecret.trim() === '' || webhookSecret === 'my_whatsapp_webhook_secret') {
@@ -291,7 +297,6 @@ async function startServer() {
 
   // --- Auth API Routes ---
 
-  // Signup
   app.post('/api/auth/signup', async (req, res) => {
     try {
       const email = normalizeEmail(req.body.email);
@@ -317,7 +322,6 @@ async function startServer() {
       const existingUser = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
       if (existingUser) {
         if (!existingUser.is_verified) {
-          // Allow requesting new verification code if unverified
           const rawCode = String(crypto.randomInt(100000, 1000000));
           const codeDigest = crypto.createHmac('sha256', CODE_SECRET).update(rawCode).digest('hex');
           
@@ -342,14 +346,13 @@ async function startServer() {
       const isFirstAdmin = adminSetupEmail !== '' && email === adminSetupEmail;
 
       const role = isFirstAdmin ? 'Administration' : 'Employee';
-      const isApproved = isFirstAdmin ? 1 : 0; // First admin is approved upon verification
+      const isApproved = isFirstAdmin ? 1 : 0;
 
       db.prepare(`
         INSERT INTO users (email, password_hash, salt, role, is_verified, is_approved, is_active, created_at)
         VALUES (?, ?, ?, ?, 0, ?, 1, ?)
       `).run(email, passwordHash, salt, role, isApproved, new Date().toISOString());
 
-      // Generate 6-digit verification code with HMAC digest
       const rawCode = String(crypto.randomInt(100000, 1000000));
       const codeDigest = crypto.createHmac('sha256', CODE_SECRET).update(rawCode).digest('hex');
 
@@ -375,7 +378,6 @@ async function startServer() {
     }
   });
 
-  // Verify Email Code (Requirement 3: Atomic check, digest verification, max 5 attempts, grant first admin if matched)
   app.post('/api/auth/verify', async (req, res) => {
     try {
       const email = normalizeEmail(req.body.email);
@@ -435,7 +437,6 @@ async function startServer() {
     }
   });
 
-  // Resend Code (Requirement 2 & 3: 60s cooldown, invalidates previous codes)
   app.post('/api/auth/resend-code', async (req, res) => {
     try {
       const email = normalizeEmail(req.body.email);
@@ -471,7 +472,6 @@ async function startServer() {
     }
   });
 
-  // Login (Requirement 4: Secure HttpOnly Cookie & CSRF token)
   app.post('/api/auth/login', async (req, res) => {
     try {
       const email = normalizeEmail(req.body.email);
@@ -531,7 +531,6 @@ async function startServer() {
     }
   });
 
-  // Logout
   app.post('/api/auth/logout', requireAuth, (req, res) => {
     const sessionId = req.cookies?.sessionId || req.headers['x-session-token'];
     if (sessionId) {
@@ -541,7 +540,6 @@ async function startServer() {
     res.json({ success: true, message: 'Logged out successfully.' });
   });
 
-  // Get current user profile & CSRF token
   app.get('/api/auth/me', requireAuth, (req, res) => {
     const user = (req as any).user;
     const sessionId = req.cookies?.sessionId;
@@ -563,7 +561,6 @@ async function startServer() {
     });
   });
 
-  // Forgot Password (Requirement 2: Generic response, no user enumeration)
   app.post('/api/auth/forgot-password', async (req, res) => {
     try {
       const email = normalizeEmail(req.body.email);
@@ -599,7 +596,6 @@ async function startServer() {
     }
   });
 
-  // Reset Password (Requirement 3: Revokes existing sessions, preserves role & approval status)
   app.post('/api/auth/reset-password', async (req, res) => {
     try {
       const email = normalizeEmail(req.body.email);
@@ -678,7 +674,6 @@ async function startServer() {
     });
   });
 
-  // Approve or disable account (Requirement 6: Prevent disabling/unapproving last active admin)
   app.post('/api/admin/users/:email/status', requireAuth, requireAdmin, (req, res) => {
     const targetEmail = normalizeEmail(req.params.email);
     const { isApproved, isActive } = req.body;
@@ -708,7 +703,6 @@ async function startServer() {
     res.json({ success: true, message: 'User status updated successfully.' });
   });
 
-  // Change Role (Requirement 6: Prevent demoting last active admin)
   app.post('/api/admin/users/:email/role', requireAuth, requireAdmin, (req, res) => {
     const targetEmail = normalizeEmail(req.params.email);
     const newRole = req.body.role;
@@ -733,7 +727,7 @@ async function startServer() {
     res.json({ success: true, message: 'User role updated successfully.' });
   });
 
-  // --- Inquiries API Routes (Requirement 1: Employee restriction & Export restriction) ---
+  // --- Inquiries API Routes ---
 
   app.get('/api/inquiries', requireAuth, async (req, res) => {
     try {
@@ -766,11 +760,10 @@ async function startServer() {
         if (result.status === 'success' && Array.isArray(result.data)) {
           rawData = result.data;
         } else {
-          return res.status(502).json({ success: false, error: result.message || 'Failed to read data from Google Sheets.' });
+          return res.status(502).json({ success: false, error: result.message || 'Failed to read data from Google Sheets ("DJ Client Base").' });
         }
       }
 
-      // Requirement 1: Employees see only their assigned leads (exact match on agentAssigned normalized email)
       let filteredData = rawData;
       if (currentUser.role === 'Employee') {
         filteredData = rawData.filter(inq => {
@@ -788,7 +781,7 @@ async function startServer() {
     }
   });
 
-  // Export Inquiries (Requirement 1: Restricted to Manager or Administration)
+  // CSV Export
   app.get('/api/inquiries/export', requireAuth, requireManagerOrAdmin, async (req, res) => {
     try {
       const mode = req.query.mode === 'live' ? 'live' : 'demo';
@@ -813,36 +806,107 @@ async function startServer() {
         }
       }
 
-      const headers = ['Date', 'Timestamp', 'Inquiry ID', 'Customer Name', 'Phone Number', 'Campaign', 'Message Summary', 'Agent Assigned', 'Status'];
+      const headers = ['Date In', 'Name', 'Whatsapp / Username', 'Gender', 'Age Group', 'State', 'Status / Remark', 'Progress'];
       const csvRows = [headers.join(',')];
       for (const inq of rawData) {
         const row = [
           inq.date,
-          `"${inq.timestamp}"`,
-          inq.inquiryId,
           `"${(inq.customerName || '').replace(/"/g, '""')}"`,
           `"${inq.phoneNumber}"`,
-          `"${inq.sourceCampaign}"`,
+          `"${inq.gender || 'Unknown'}"`,
+          `"${inq.ageGroup || ''}"`,
+          `"${inq.state || ''}"`,
           `"${(inq.messageSummary || '').replace(/"/g, '""')}"`,
-          `"${inq.agentAssigned}"`,
-          inq.status
+          `"${inq.progress || ''}"`
         ];
         csvRows.push(row.join(','));
       }
 
       res.setHeader('Content-Type', 'text/csv');
-      res.setHeader('Content-Disposition', 'attachment; filename=djoyplus_inquiries_export.csv');
+      res.setHeader('Content-Disposition', 'attachment; filename="DJ_Client_Base_Export.csv"');
       res.send(csvRows.join('\n'));
     } catch (err: any) {
       res.status(500).send('Export error: ' + err.toString());
     }
   });
 
-  // --- CRM Webhook Ingestion (Independent of staff sessions) ---
+  // Excel (.xlsx) Export matching “MP Ads Spend vs Revenue vs Client Inquiries” template ("DJ Client Base" sheet)
+  app.get('/api/inquiries/export-excel', requireAuth, requireManagerOrAdmin, async (req, res) => {
+    try {
+      const mode = req.query.mode === 'live' ? 'live' : 'demo';
+      let rawData: InquiryRecord[] = [];
+
+      if (mode === 'demo') {
+        rawData = demoInquiries;
+      } else {
+        const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL;
+        const readSecret = process.env.APPS_SCRIPT_READ_SECRET;
+        if (!appsScriptUrl || !readSecret) {
+          return res.status(503).json({ success: false, error: 'Live read access not configured.' });
+        }
+        const response = await fetch(appsScriptUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ operation: 'read', credential: readSecret })
+        });
+        const result = await response.json();
+        if (result.status === 'success' && Array.isArray(result.data)) {
+          rawData = result.data;
+        }
+      }
+
+      const wb = XLSX.utils.book_new();
+      const wsData: any[][] = [];
+
+      // Row 1: Legend (H1: Status, I1: 25%, J1: 50%, K1: 75%, L1: 100%)
+      wsData.push(['', '', '', '', '', '', '', 'Status', '25%', '50%', '75%', '100%']);
+      // Row 2: Headers (A2: '', B2: Date In, C2: Name, D2: Whatsapp / Username, E2: Gender (F/M/Unknown), F2: Age Group, G2: State, H2: Status / Remark)
+      wsData.push(['', 'Date In', 'Name', 'Whatsapp / Username', 'Gender (F/M/Unknown)', 'Age Group', 'State', 'Status / Remark']);
+
+      for (const inq of rawData) {
+        wsData.push([
+          '',
+          inq.date,
+          inq.customerName,
+          String(inq.phoneNumber || ''),
+          inq.gender || 'Unknown',
+          inq.ageGroup || '',
+          inq.state || '',
+          inq.messageSummary || ''
+        ]);
+      }
+
+      const ws = XLSX.utils.aoa_to_sheet(wsData);
+
+      // Set column widths and text formatting for column D (Whatsapp / Username)
+      ws['!cols'] = [
+        { wch: 5 },  // A
+        { wch: 12 }, // B: Date In
+        { wch: 22 }, // C: Name
+        { wch: 20 }, // D: Whatsapp / Username
+        { wch: 15 }, // E: Gender
+        { wch: 12 }, // F: Age Group
+        { wch: 15 }, // G: State
+        { wch: 45 }  // H: Status / Remark
+      ];
+
+      XLSX.utils.book_append_sheet(wb, ws, 'DJ Client Base');
+      const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', 'attachment; filename="MP Ads Spend vs Revenue vs Client Inquiries.xlsx"');
+      res.send(buf);
+    } catch (err: any) {
+      console.error('Excel export error:', err);
+      res.status(500).send('Excel export error: ' + err.toString());
+    }
+  });
+
+  // --- CRM Webhook Ingestion ---
   app.post('/api/webhook/whatsapp', verifyWebhookSecret, async (req, res) => {
     try {
       const body = req.body;
-      const { date, timestamp, inquiryId, customerName, phoneNumber, sourceCampaign, messageSummary, agentAssigned, status } = body;
+      const { inquiryId, customerName, phoneNumber, gender, ageGroup, state, sourceCampaign, messageSummary, agentAssigned, status, progress } = body;
 
       if (!inquiryId || !customerName || !phoneNumber) {
         return res.status(400).json({ status: 'error', code: 'INVALID_PAYLOAD', message: 'Missing required inquiry fields.' });
@@ -856,15 +920,19 @@ async function startServer() {
       }
 
       const newInquiry: InquiryRecord = {
-        date: date || new Date().toISOString().split('T')[0],
-        timestamp: timestamp || new Date().toISOString().replace('T', ' ').substring(0, 19),
+        date: new Date().toISOString().split('T')[0],
+        timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
         inquiryId,
         customerName,
         phoneNumber,
+        gender: gender || 'Unknown',
+        ageGroup: ageGroup || '',
+        state: state || '',
         sourceCampaign: sourceCampaign || 'Direct_WhatsApp',
         messageSummary: messageSummary || '',
         agentAssigned: agentAssigned || 'Unassigned',
-        status: status || 'New'
+        status: status || 'New',
+        progress: progress || ''
       };
 
       const envelope = { operation: 'write', credential: writeSecret, payload: newInquiry };
@@ -879,8 +947,8 @@ async function startServer() {
       }
 
       const result = await response.json();
-      if (result.status === 'success') {
-        return res.json({ status: 'success', message: 'Inquiry successfully saved to Google Sheets.' });
+      if (result.status === 'success' || result.status === 'updated') {
+        return res.json({ status: 'success', message: 'Inquiry successfully synced to Google Sheets ("DJ Client Base").' });
       } else {
         return res.status(503).json({ status: 'error', code: 'SHEETS_WRITE_FAILED', message: result.message || 'Google Sheets rejected the write.' });
       }
@@ -890,7 +958,7 @@ async function startServer() {
     }
   });
 
-  // --- Gemini Mapper Proxy (Rate-limited, API key protected on server) ---
+  // --- Gemini Mapper Proxy ---
   app.post('/api/gemini/map', requireAuth, geminiRateLimiter, async (req, res) => {
     try {
       const apiKey = process.env.GEMINI_API_KEY;
@@ -902,7 +970,7 @@ async function startServer() {
       const ai = new GoogleGenAI({ apiKey });
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
-        contents: `Map the following WhatsApp inquiry JSON payload into standard CRM format { inquiryId, customerName, phoneNumber, sourceCampaign, messageSummary, agentAssigned, status }:\n${JSON.stringify(payload)}`
+        contents: `Map the following WhatsApp inquiry JSON payload into standard CRM format { inquiryId, customerName, phoneNumber, gender, ageGroup, state, sourceCampaign, messageSummary, agentAssigned, status, progress } for worksheet "DJ Client Base":\n${JSON.stringify(payload)}`
       });
 
       res.json({ success: true, result: response.text });
