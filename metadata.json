@@ -1,0 +1,6 @@
+{
+  "name": "WhatsApp Sheets Automation Hub",
+  "description": "End-to-end automation cockpit and simulator for syncing WhatsApp inquiries from third-party platforms into Google Sheets with real-time webhooks and Google Apps Script.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
