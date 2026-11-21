@@ -120,39 +120,7 @@ interface InquiryRecord {
   progress?: string;
 }
 
-// In-memory demo inquiries matching DJ Client Base layout
-let demoInquiries: InquiryRecord[] = [
-  {
-    date: new Date().toISOString().split('T')[0],
-    timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
-    inquiryId: 'WH-88392',
-    customerName: 'Sarah Jenkins (陳美玲)',
-    phoneNumber: '+60123456789',
-    gender: 'F',
-    ageGroup: '26-35',
-    state: 'Selangor',
-    sourceCampaign: 'Meta_FB_Promo_Nov',
-    messageSummary: '[21/11/26 10:30] Inquired about pricing and availability for enterprise tier.\n[21/11/26 14:15] Followed up via WhatsApp call. Interested.',
-    agentAssigned: 'employee1@djoyplus.com',
-    status: 'Qualified',
-    progress: '75%'
-  },
-  {
-    date: new Date().toISOString().split('T')[0],
-    timestamp: new Date(Date.now() - 3600000 * 2).toISOString().replace('T', ' ').substring(0, 19),
-    inquiryId: 'WH-88391',
-    customerName: 'Marcus Vance',
-    phoneNumber: '@marcus_v_2026',
-    gender: 'M',
-    ageGroup: '36-45',
-    state: 'Kuala Lumpur',
-    sourceCampaign: 'Google_Search_Brand',
-    messageSummary: '[21/11/26 09:00] Asked for onboarding documentation.',
-    agentAssigned: 'employee2@djoyplus.com',
-    status: 'Closed',
-    progress: '100%'
-  }
-];
+let demoInquiries: InquiryRecord[] = [];
 
 // Password hashing with crypto.scryptSync
 function hashPassword(password: string, existingSalt?: string): { passwordHash: string; salt: string } {
@@ -735,6 +703,24 @@ async function startServer() {
 
     db.prepare('UPDATE users SET role = ? WHERE email = ?').run(newRole, targetEmail);
     res.json({ success: true, message: 'User role updated successfully.' });
+  });
+
+  // Cleanup dry run endpoint for identifying seeded or demo test accounts
+  app.post('/api/admin/cleanup-dry-run', requireAuth, requireAdmin, (req, res) => {
+    try {
+      const users = db.prepare('SELECT email, role, is_verified, is_approved, is_active, created_at FROM users').all() as any[];
+      const seededUsers = users.filter(u => u.email.includes('demo') || u.email.includes('test') || u.email.includes('example.com'));
+      
+      res.json({
+        success: true,
+        dryRun: true,
+        affectedUsersCount: seededUsers.length,
+        affectedUsers: seededUsers.map(u => u.email),
+        message: 'Dry run completed. No records have been deleted. Review the list above before requesting approval for deletion.'
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.toString() });
+    }
   });
 
   // SMTP Connection & Authentication Test Route
