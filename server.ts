@@ -167,8 +167,7 @@ function verifyPassword(password: string, hash: string, salt: string): boolean {
 }
 
 function isValidPassword(password: string): boolean {
-  const regex = /^(?=.*[a-zA-Z])(?=.*\d)[a-zA-Z0-9]{6}$/;
-  return regex.test(password);
+  return typeof password === 'string' && password.length >= 6;
 }
 
 function normalizeEmail(email: string): string {
@@ -313,7 +312,7 @@ async function startServer() {
       }
 
       if (!isValidPassword(password)) {
-        return res.status(400).json({ success: false, error: 'Password must be exactly 6 alphanumeric characters, including at least one letter and one number.' });
+        return res.status(400).json({ success: false, error: 'Your password must be at least 6 characters.' });
       }
 
       if (!checkRateLimit(`signup:${email}`, 5, 3600000)) {
@@ -392,28 +391,33 @@ async function startServer() {
         return res.status(429).json({ success: false, error: 'Too many verification attempts. Please request a new code.' });
       }
 
-      const verifyTx = db.transaction(() => {
-        const codeRecord = db.prepare('SELECT * FROM codes WHERE email = ? AND type = ?').get(email, 'verify') as any;
+      const codeRecord = db.prepare('SELECT * FROM codes WHERE email = ? AND type = ?').get(email, 'verify') as any;
 
-        if (!codeRecord || codeRecord.expires_at < Date.now()) {
-          throw new Error('Invalid or expired verification code.');
-        }
+      if (!codeRecord || codeRecord.expires_at < Date.now()) {
+        return res.status(400).json({ success: false, error: 'Invalid or expired verification code.' });
+      }
 
-        if (codeRecord.attempts >= 5) {
+      if (codeRecord.attempts >= 5) {
+        db.prepare('DELETE FROM codes WHERE id = ?').run(codeRecord.id);
+        return res.status(400).json({ success: false, error: 'Maximum attempts exceeded for this code. Please request a new one.' });
+      }
+
+      const isValid = crypto.timingSafeEqual(
+        Buffer.from(crypto.createHmac('sha256', CODE_SECRET).update(codeInput).digest('hex'), 'hex'),
+        Buffer.from(codeRecord.code_digest, 'hex')
+      );
+
+      if (!isValid) {
+        db.prepare('UPDATE codes SET attempts = attempts + 1 WHERE id = ?').run(codeRecord.id);
+        const updated = db.prepare('SELECT attempts FROM codes WHERE id = ?').get(codeRecord.id) as any;
+        if (updated && updated.attempts >= 5) {
           db.prepare('DELETE FROM codes WHERE id = ?').run(codeRecord.id);
-          throw new Error('Maximum attempts exceeded for this code. Please request a new one.');
+          return res.status(400).json({ success: false, error: 'Maximum attempts exceeded for this code. Please request a new one.' });
         }
+        return res.status(400).json({ success: false, error: 'Incorrect verification code.' });
+      }
 
-        const isValid = crypto.timingSafeEqual(
-          Buffer.from(crypto.createHmac('sha256', CODE_SECRET).update(codeInput).digest('hex'), 'hex'),
-          Buffer.from(codeRecord.code_digest, 'hex')
-        );
-
-        if (!isValid) {
-          db.prepare('UPDATE codes SET attempts = attempts + 1 WHERE id = ?').run(codeRecord.id);
-          throw new Error('Incorrect verification code.');
-        }
-
+      const verifyTx = db.transaction(() => {
         const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
         if (!user) {
           throw new Error('User not found.');
@@ -613,31 +617,36 @@ async function startServer() {
       }
 
       if (!isValidPassword(newPassword)) {
-        return res.status(400).json({ success: false, error: 'Password must be exactly 6 alphanumeric characters, including at least one letter and one number.' });
+        return res.status(400).json({ success: false, error: 'Your password must be at least 6 characters.' });
+      }
+
+      const codeRecord = db.prepare('SELECT * FROM codes WHERE email = ? AND type = ?').get(email, 'reset') as any;
+
+      if (!codeRecord || codeRecord.expires_at < Date.now()) {
+        return res.status(400).json({ success: false, error: 'Invalid or expired password reset code.' });
+      }
+
+      if (codeRecord.attempts >= 5) {
+        db.prepare('DELETE FROM codes WHERE id = ?').run(codeRecord.id);
+        return res.status(400).json({ success: false, error: 'Maximum attempts exceeded for this code. Please request a new one.' });
+      }
+
+      const isValid = crypto.timingSafeEqual(
+        Buffer.from(crypto.createHmac('sha256', CODE_SECRET).update(codeInput).digest('hex'), 'hex'),
+        Buffer.from(codeRecord.code_digest, 'hex')
+      );
+
+      if (!isValid) {
+        db.prepare('UPDATE codes SET attempts = attempts + 1 WHERE id = ?').run(codeRecord.id);
+        const updated = db.prepare('SELECT attempts FROM codes WHERE id = ?').get(codeRecord.id) as any;
+        if (updated && updated.attempts >= 5) {
+          db.prepare('DELETE FROM codes WHERE id = ?').run(codeRecord.id);
+          return res.status(400).json({ success: false, error: 'Maximum attempts exceeded for this code. Please request a new one.' });
+        }
+        return res.status(400).json({ success: false, error: 'Incorrect password reset code.' });
       }
 
       const resetTx = db.transaction(() => {
-        const codeRecord = db.prepare('SELECT * FROM codes WHERE email = ? AND type = ?').get(email, 'reset') as any;
-
-        if (!codeRecord || codeRecord.expires_at < Date.now()) {
-          throw new Error('Invalid or expired password reset code.');
-        }
-
-        if (codeRecord.attempts >= 5) {
-          db.prepare('DELETE FROM codes WHERE id = ?').run(codeRecord.id);
-          throw new Error('Maximum attempts exceeded for this code. Please request a new one.');
-        }
-
-        const isValid = crypto.timingSafeEqual(
-          Buffer.from(crypto.createHmac('sha256', CODE_SECRET).update(codeInput).digest('hex'), 'hex'),
-          Buffer.from(codeRecord.code_digest, 'hex')
-        );
-
-        if (!isValid) {
-          db.prepare('UPDATE codes SET attempts = attempts + 1 WHERE id = ?').run(codeRecord.id);
-          throw new Error('Incorrect password reset code.');
-        }
-
         const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
         if (!user) {
           throw new Error('User not found.');

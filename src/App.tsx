@@ -943,10 +943,9 @@ function createJsonResponse(obj) {
                   <input
                     type={showPassword ? 'text' : 'password'}
                     required
-                    maxLength={6}
                     value={authPasswordInput}
                     onChange={(e) => setAuthPasswordInput(e.target.value)}
-                    placeholder="6 chars (e.g. A1b2C3)"
+                    placeholder="At least 6 characters"
                     className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-3.5 pr-10 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-emerald-500 transition"
                   />
                   <button
@@ -958,7 +957,7 @@ function createJsonResponse(obj) {
                   </button>
                 </div>
                 <p className="mt-1 text-[11px] text-slate-400">
-                  Must be exactly 6 alphanumeric characters including at least one letter and one number.
+                  Use at least 6 characters.
                 </p>
               </div>
 
@@ -1013,10 +1012,9 @@ function createJsonResponse(obj) {
                   <input
                     type={showPassword ? 'text' : 'password'}
                     required
-                    maxLength={6}
                     value={authPasswordInput}
                     onChange={(e) => setAuthPasswordInput(e.target.value)}
-                    placeholder="6 chars (e.g. A1b2C3)"
+                    placeholder="At least 6 characters"
                     className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-3.5 pr-10 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-emerald-500 transition"
                   />
                   <button
@@ -1028,7 +1026,7 @@ function createJsonResponse(obj) {
                   </button>
                 </div>
                 <p className="mt-1 text-[11px] text-slate-400">
-                  Must be exactly 6 alphanumeric characters including at least one letter and one number.
+                  Use at least 6 characters.
                 </p>
               </div>
 
@@ -1039,10 +1037,9 @@ function createJsonResponse(obj) {
                 <input
                   type="password"
                   required
-                  maxLength={6}
                   value={authConfirmPassword}
                   onChange={(e) => setAuthConfirmPassword(e.target.value)}
-                  placeholder="Re-enter 6-char password"
+                  placeholder="Re-enter password"
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-emerald-500 transition"
                 />
               </div>
@@ -1180,14 +1177,13 @@ function createJsonResponse(obj) {
                 <input
                   type="password"
                   required
-                  maxLength={6}
                   value={authPasswordInput}
                   onChange={(e) => setAuthPasswordInput(e.target.value)}
-                  placeholder="6 chars (e.g. A1b2C3)"
+                  placeholder="At least 6 characters"
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-emerald-500 transition"
                 />
                 <p className="mt-1 text-[11px] text-slate-400">
-                  Must be exactly 6 alphanumeric characters including at least one letter and one number.
+                  Use at least 6 characters.
                 </p>
               </div>
 
@@ -1198,10 +1194,9 @@ function createJsonResponse(obj) {
                 <input
                   type="password"
                   required
-                  maxLength={6}
                   value={authConfirmPassword}
                   onChange={(e) => setAuthConfirmPassword(e.target.value)}
-                  placeholder="Re-enter 6-char password"
+                  placeholder="Re-enter password"
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-emerald-500 transition"
                 />
               </div>
