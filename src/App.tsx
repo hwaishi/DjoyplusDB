@@ -31,7 +31,14 @@ import {
   HelpCircle,
   ArrowUpRight,
   AlertCircle,
-  DatabaseBackup
+  DatabaseBackup,
+  LogOut,
+  Eye,
+  EyeOff,
+  UserCheck,
+  UserX,
+  Mail,
+  CheckCircle2
 } from 'lucide-react';
 
 interface InquiryRecord {
@@ -44,6 +51,15 @@ interface InquiryRecord {
   messageSummary: string;
   agentAssigned: string;
   status: 'New' | 'In Progress' | 'Qualified' | 'Closed' | 'Lost';
+}
+
+interface UserProfile {
+  email: string;
+  role: 'Administration' | 'Manager' | 'Employee';
+  isVerified?: boolean;
+  isApproved?: boolean;
+  isActive?: boolean;
+  createdAt?: string;
 }
 
 const PRESET_PAYLOADS = {
@@ -92,16 +108,30 @@ const PRESET_PAYLOADS = {
 };
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'simulator' | 'webhook' | 'gas' | 'ai' | 'blueprint'>('dashboard');
-  const [dataMode, setDataMode] = useState<'demo' | 'live'>('demo');
-  const [staffToken, setStaffToken] = useState<string>(localStorage.getItem('sheetflow_staff_token') || '');
-  const [authStatus, setAuthStatus] = useState<{ staffKeySet: boolean; webhookSecretSet: boolean; readSecretSet: boolean; writeSecretSet: boolean; geminiKeySet: boolean; appsScriptUrlSet: boolean } | null>(null);
+  // Auth state
+  const [sessionToken, setSessionToken] = useState<string>(localStorage.getItem('dj_session_token') || '');
+  const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
+  const [authView, setAuthView] = useState<'login' | 'signup' | 'verify' | 'forgot' | 'reset' | 'pending_approval'>('login');
+  const [authEmailInput, setAuthEmailInput] = useState('');
+  const [authPasswordInput, setAuthPasswordInput] = useState('');
+  const [authConfirmPassword, setAuthConfirmPassword] = useState('');
+  const [authCodeInput, setAuthCodeInput] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authMessage, setAuthMessage] = useState<string | null>(null);
+  const [resendCountdown, setResendCountdown] = useState(0);
 
+  // App state
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'simulator' | 'webhook' | 'gas' | 'ai' | 'blueprint' | 'admin'>('dashboard');
+  const [dataMode, setDataMode] = useState<'demo' | 'live'>('demo');
   const [inquiries, setInquiries] = useState<InquiryRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [sheetTab, setSheetTab] = useState<'raw' | 'summary'>('raw');
-  
+
+  // Admin users list state
+  const [adminUsers, setAdminUsers] = useState<UserProfile[]>([]);
+
   // Webhook Tester State
   const [selectedPreset, setSelectedPreset] = useState<keyof typeof PRESET_PAYLOADS>('manychat');
   const [customPayloadJson, setCustomPayloadJson] = useState(JSON.stringify(PRESET_PAYLOADS.manychat, null, 2));
@@ -124,35 +154,64 @@ export default function App() {
   const [aiAnalysisResult, setAiAnalysisResult] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
 
-  // Search & Filter state for simulator
+  // Search & Filter state
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('All');
 
-  // Check server auth status on mount
+  // Check session on mount
   useEffect(() => {
-    fetchAuthStatus();
-  }, []);
-
-  // Fetch inquiries whenever mode or token changes
-  useEffect(() => {
-    if (staffToken) {
-      fetchInquiries();
-    } else {
-      setLoading(false);
-      setInquiries([]);
+    if (sessionToken) {
+      fetchCurrentUser();
     }
-  }, [dataMode, staffToken]);
+  }, [sessionToken]);
 
-  const fetchAuthStatus = async () => {
+  // Fetch inquiries when sessionToken or dataMode changes
+  useEffect(() => {
+    if (sessionToken && currentUser?.isVerified && currentUser?.isApproved) {
+      fetchInquiries();
+    }
+  }, [sessionToken, dataMode, currentUser]);
+
+  // Resend countdown timer
+  useEffect(() => {
+    if (resendCountdown > 0) {
+      const timer = setTimeout(() => setResendCountdown(resendCountdown - 1), 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [resendCountdown]);
+
+  const fetchCurrentUser = async () => {
     try {
-      const res = await fetch('/api/auth/status');
+      const res = await fetch('/api/auth/me', {
+        headers: { 'Authorization': `Bearer ${sessionToken}` }
+      });
       const data = await res.json();
       if (data.success) {
-        setAuthStatus(data.config);
+        setCurrentUser(data.user);
+        if (!data.user.isVerified) {
+          setAuthView('verify');
+        } else if (!data.user.isApproved) {
+          setAuthView('pending_approval');
+        }
+      } else {
+        handleLogout();
       }
     } catch (err) {
-      console.error('Failed to fetch auth status:', err);
+      handleLogout();
     }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${sessionToken}` }
+      });
+    } catch (e) {}
+    setSessionToken('');
+    setCurrentUser(null);
+    localStorage.removeItem('dj_session_token');
+    setAuthView('login');
   };
 
   const fetchInquiries = async () => {
@@ -160,15 +219,13 @@ export default function App() {
       setLoading(true);
       setErrorMsg(null);
       const res = await fetch(`/api/inquiries?mode=${dataMode}`, {
-        headers: {
-          'x-staff-token': staffToken
-        }
+        headers: { 'Authorization': `Bearer ${sessionToken}` }
       });
       const data = await res.json();
       if (data.success) {
         setInquiries(data.data || []);
       } else {
-        setErrorMsg(data.error || 'Failed to authenticate or load leads from Google Sheet.');
+        setErrorMsg(data.error || 'Failed to load inquiries.');
         setInquiries([]);
       }
     } catch (err: any) {
@@ -179,22 +236,227 @@ export default function App() {
     }
   };
 
-  const handleSaveToken = (token: string) => {
-    setStaffToken(token);
-    localStorage.setItem('sheetflow_staff_token', token);
+  const handleLoginSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthMessage(null);
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authEmailInput, password: authPasswordInput })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setSessionToken(data.token);
+        localStorage.setItem('dj_session_token', data.token);
+        setCurrentUser(data.user);
+        if (!data.user.isVerified) {
+          setAuthView('verify');
+        } else if (!data.user.isApproved) {
+          setAuthView('pending_approval');
+        }
+      } else {
+        if (data.unverified) {
+          setAuthView('verify');
+        } else if (data.pendingApproval) {
+          setAuthView('pending_approval');
+        }
+        setAuthError(data.error || 'Login failed.');
+      }
+    } catch (err: any) {
+      setAuthError(err.toString());
+    }
+  };
+
+  const handleSignupSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthMessage(null);
+    try {
+      const res = await fetch('/api/auth/signup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authEmailInput, password: authPasswordInput, confirmPassword: authConfirmPassword })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setAuthMessage(data.message);
+        setAuthView('verify');
+        setResendCountdown(60);
+      } else {
+        setAuthError(data.error || 'Signup failed.');
+      }
+    } catch (err: any) {
+      setAuthError(err.toString());
+    }
+  };
+
+  const handleVerifySubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthMessage(null);
+    try {
+      const res = await fetch('/api/auth/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authEmailInput, code: authCodeInput })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setAuthMessage(data.message);
+        setTimeout(() => {
+          setAuthView('login');
+          setAuthPasswordInput('');
+          setAuthMessage('Email verified. You can now sign in.');
+        }, 1500);
+      } else {
+        setAuthError(data.error || 'Verification failed.');
+      }
+    } catch (err: any) {
+      setAuthError(err.toString());
+    }
+  };
+
+  const handleResendCode = async (type: 'verify' | 'reset') => {
+    setAuthError(null);
+    setAuthMessage(null);
+    try {
+      const res = await fetch('/api/auth/resend-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authEmailInput, type })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setAuthMessage(data.message);
+        setResendCountdown(60);
+      } else {
+        setAuthError(data.error || 'Failed to resend code.');
+      }
+    } catch (err: any) {
+      setAuthError(err.toString());
+    }
+  };
+
+  const handleForgotSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthMessage(null);
+    try {
+      const res = await fetch('/api/auth/forgot-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authEmailInput })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setAuthMessage(data.message);
+        setAuthView('reset');
+        setResendCountdown(60);
+      } else {
+        setAuthError(data.error || 'Request failed.');
+      }
+    } catch (err: any) {
+      setAuthError(err.toString());
+    }
+  };
+
+  const handleResetSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthMessage(null);
+    try {
+      const res = await fetch('/api/auth/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authEmailInput, code: authCodeInput, newPassword: authPasswordInput, confirmPassword: authConfirmPassword })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setAuthMessage(data.message);
+        setTimeout(() => {
+          setAuthView('login');
+          setAuthPasswordInput('');
+          setAuthConfirmPassword('');
+        }, 2000);
+      } else {
+        setAuthError(data.error || 'Password reset failed.');
+      }
+    } catch (err: any) {
+      setAuthError(err.toString());
+    }
+  };
+
+  const fetchAdminUsers = async () => {
+    try {
+      const res = await fetch('/api/admin/users', {
+        headers: { 'Authorization': `Bearer ${sessionToken}` }
+      });
+      const data = await res.json();
+      if (data.success) {
+        setAdminUsers(data.users);
+      }
+    } catch (e) {}
+  };
+
+  useEffect(() => {
+    if (currentUser?.role === 'Administration' && activeTab === 'admin') {
+      fetchAdminUsers();
+    }
+  }, [currentUser, activeTab]);
+
+  const handleAdminStatusChange = async (targetEmail: string, isApproved: boolean, isActive: boolean) => {
+    try {
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(targetEmail)}/status`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${sessionToken}`
+        },
+        body: JSON.stringify({ isApproved, isActive })
+      });
+      const data = await res.json();
+      if (data.success) {
+        fetchAdminUsers();
+      } else {
+        alert(data.error || 'Action failed.');
+      }
+    } catch (err: any) {
+      alert('Action failed: ' + err.toString());
+    }
+  };
+
+  const handleAdminRoleChange = async (targetEmail: string, newRole: string) => {
+    try {
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(targetEmail)}/role`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${sessionToken}`
+        },
+        body: JSON.stringify({ role: newRole })
+      });
+      const data = await res.json();
+      if (data.success) {
+        fetchAdminUsers();
+      } else {
+        alert(data.error || 'Role change failed.');
+      }
+    } catch (err: any) {
+      alert('Role change failed: ' + err.toString());
+    }
   };
 
   const handleResetData = async () => {
     if (dataMode === 'live') {
-      alert('Reset is restricted to Demo Sandbox records only. Live Google Sheets leads are durable.');
+      alert('Reset is restricted to Demo Sandbox records only.');
       return;
     }
     try {
       const res = await fetch('/api/inquiries/reset', {
         method: 'POST',
-        headers: {
-          'x-staff-token': staffToken
-        }
+        headers: { 'Authorization': `Bearer ${sessionToken}` }
       });
       const data = await res.json();
       if (data.success) {
@@ -215,7 +477,7 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-staff-token': staffToken
+          'Authorization': `Bearer ${sessionToken}`
         },
         body: JSON.stringify({ dryRun })
       });
@@ -241,7 +503,7 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-staff-token': staffToken
+          'Authorization': `Bearer ${sessionToken}`
         },
         body: JSON.stringify(parsedPayload)
       });
@@ -271,7 +533,7 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-staff-token': staffToken
+          'Authorization': `Bearer ${sessionToken}`
         },
         body: JSON.stringify({ platformName: aiPlatformName, jsonPayload: parsed })
       });
@@ -288,7 +550,7 @@ export default function App() {
     }
   };
 
-  // Compute Daily Summaries from inquiries
+  // Compute Daily Summaries
   const summaryMap = inquiries.reduce((acc: Record<string, { date: string; total: number; phones: Set<string>; qualified: number; closed: number }>, item) => {
     const d = item.date || new Date().toISOString().split('T')[0];
     if (!acc[d]) {
@@ -459,7 +721,6 @@ function handleWrite(payload) {
         const existingAgent = sheet.getRange(existingRowIndex, 8).getValue();
         const existingStatus = sheet.getRange(existingRowIndex, 9).getValue();
         
-        // Update only timestamp and supplied fields. If message or agent omitted, leave existing cells untouched.
         sheet.getRange(existingRowIndex, 2).setValue(timestampStr);
         if (messageSummary !== null) {
           sheet.getRange(existingRowIndex, 7).setValue(safeText(messageSummary));
@@ -641,6 +902,365 @@ function createJsonResponse(obj) {
     .setMimeType(ContentService.MimeType.JSON);
 }`;
 
+  // If not signed in or not verified/approved, render Auth Views
+  if (!sessionToken || !currentUser || !currentUser.isVerified || !currentUser.isApproved) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-4 font-sans">
+        <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-xl space-y-6">
+          <div className="text-center space-y-2">
+            <div className="inline-flex bg-gradient-to-tr from-emerald-500 to-teal-400 p-3 rounded-2xl shadow-lg shadow-emerald-950/50 mb-2">
+              <FileSpreadsheet className="w-8 h-8 text-slate-950 stroke-[2.5]" />
+            </div>
+            <h1 className="text-2xl font-bold tracking-tight text-white">
+              {authView === 'login' && "Sign in to D' Joy Plus"}
+              {authView === 'signup' && "Create an Account"}
+              {authView === 'verify' && "Email Verification"}
+              {authView === 'forgot' && "Forgot Password"}
+              {authView === 'reset' && "Reset Password"}
+              {authView === 'pending_approval' && "Waiting for Approval"}
+            </h1>
+            <p className="text-xs text-slate-400">
+              {authView === 'login' && "Secure staff dashboard & Google Sheets sync"}
+              {authView === 'signup' && "Register a new staff account"}
+              {authView === 'verify' && "Enter the 6-digit code sent to your email"}
+              {authView === 'forgot' && "Enter your email to receive a password reset code"}
+              {authView === 'reset' && "Enter your reset code and new password"}
+              {authView === 'pending_approval' && "Your email is verified. Administration approval is required for lead access."}
+            </p>
+          </div>
+
+          {authError && (
+            <div className="bg-red-500/10 border border-red-500/20 text-red-400 p-3 rounded-xl text-xs flex items-center space-x-2">
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              <span>{authError}</span>
+            </div>
+          )}
+
+          {authMessage && (
+            <div className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 p-3 rounded-xl text-xs flex items-center space-x-2">
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+              <span>{authMessage}</span>
+            </div>
+          )}
+
+          {/* LOGIN VIEW */}
+          {authView === 'login' && (
+            <form onSubmit={handleLoginSubmit} className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-300 uppercase tracking-wider mb-1.5">
+                  Email Address
+                </label>
+                <input
+                  type="email"
+                  required
+                  value={authEmailInput}
+                  onChange={(e) => setAuthEmailInput(e.target.value)}
+                  placeholder="staff@djoyplus.com"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500 transition"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 uppercase tracking-wider mb-1.5">
+                  Password
+                </label>
+                <div className="relative">
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    required
+                    maxLength={6}
+                    value={authPasswordInput}
+                    onChange={(e) => setAuthPasswordInput(e.target.value)}
+                    placeholder="6 chars (e.g. A1b2C3)"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-3.5 pr-10 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-emerald-500 transition"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-3 top-2.5 text-slate-400 hover:text-white"
+                  >
+                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+                <p className="mt-1 text-[11px] text-slate-400">
+                  Must be exactly 6 alphanumeric characters including at least one letter and one number.
+                </p>
+              </div>
+
+              <div className="flex items-center justify-between text-xs pt-1">
+                <button
+                  type="button"
+                  onClick={() => { setAuthView('signup'); setAuthError(null); setAuthMessage(null); }}
+                  className="text-emerald-400 hover:underline"
+                >
+                  Create an Account
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setAuthView('forgot'); setAuthError(null); setAuthMessage(null); }}
+                  className="text-slate-400 hover:text-white hover:underline"
+                >
+                  Forgot Password?
+                </button>
+              </div>
+
+              <button
+                type="submit"
+                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2.5 px-4 rounded-lg text-sm transition shadow-lg shadow-emerald-950/50 mt-2"
+              >
+                Sign In
+              </button>
+            </form>
+          )}
+
+          {/* SIGNUP VIEW */}
+          {authView === 'signup' && (
+            <form onSubmit={handleSignupSubmit} className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-300 uppercase tracking-wider mb-1.5">
+                  Email Address
+                </label>
+                <input
+                  type="email"
+                  required
+                  value={authEmailInput}
+                  onChange={(e) => setAuthEmailInput(e.target.value)}
+                  placeholder="staff@djoyplus.com"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500 transition"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 uppercase tracking-wider mb-1.5">
+                  Password
+                </label>
+                <div className="relative">
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    required
+                    maxLength={6}
+                    value={authPasswordInput}
+                    onChange={(e) => setAuthPasswordInput(e.target.value)}
+                    placeholder="6 chars (e.g. A1b2C3)"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-3.5 pr-10 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-emerald-500 transition"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-3 top-2.5 text-slate-400 hover:text-white"
+                  >
+                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+                <p className="mt-1 text-[11px] text-slate-400">
+                  Must be exactly 6 alphanumeric characters including at least one letter and one number.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 uppercase tracking-wider mb-1.5">
+                  Confirm Password
+                </label>
+                <input
+                  type="password"
+                  required
+                  maxLength={6}
+                  value={authConfirmPassword}
+                  onChange={(e) => setAuthConfirmPassword(e.target.value)}
+                  placeholder="Re-enter 6-char password"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-emerald-500 transition"
+                />
+              </div>
+
+              <div className="flex items-center justify-between text-xs pt-1">
+                <button
+                  type="button"
+                  onClick={() => { setAuthView('login'); setAuthError(null); setAuthMessage(null); }}
+                  className="text-emerald-400 hover:underline"
+                >
+                  Already have an account? Sign In
+                </button>
+              </div>
+
+              <button
+                type="submit"
+                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2.5 px-4 rounded-lg text-sm transition shadow-lg shadow-emerald-950/50 mt-2"
+              >
+                Create Account
+              </button>
+            </form>
+          )}
+
+          {/* VERIFY VIEW */}
+          {authView === 'verify' && (
+            <form onSubmit={handleVerifySubmit} className="space-y-4">
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 text-xs text-slate-300 space-y-2">
+                <div className="flex items-center space-x-2 text-emerald-400 font-semibold">
+                  <Mail className="w-4 h-4" />
+                  <span>Verification code sent to:</span>
+                </div>
+                <div className="font-mono text-white font-medium">{authEmailInput}</div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 uppercase tracking-wider mb-1.5">
+                  6-Digit Verification Code
+                </label>
+                <input
+                  type="text"
+                  required
+                  maxLength={6}
+                  value={authCodeInput}
+                  onChange={(e) => setAuthCodeInput(e.target.value)}
+                  placeholder="123456"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2.5 text-center text-lg font-mono text-emerald-400 tracking-widest focus:outline-none focus:border-emerald-500 transition"
+                />
+              </div>
+
+              <div className="flex items-center justify-between text-xs pt-1">
+                <button
+                  type="button"
+                  disabled={resendCountdown > 0}
+                  onClick={() => handleResendCode('verify')}
+                  className="text-emerald-400 hover:underline disabled:opacity-50"
+                >
+                  {resendCountdown > 0 ? `Resend code in ${resendCountdown}s` : 'Resend Code'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setAuthView('signup'); setAuthError(null); setAuthMessage(null); }}
+                  className="text-slate-400 hover:text-white hover:underline"
+                >
+                  Correct Email
+                </button>
+              </div>
+
+              <button
+                type="submit"
+                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2.5 px-4 rounded-lg text-sm transition shadow-lg shadow-emerald-950/50 mt-2"
+              >
+                Verify Email
+              </button>
+            </form>
+          )}
+
+          {/* FORGOT PASSWORD VIEW */}
+          {authView === 'forgot' && (
+            <form onSubmit={handleForgotSubmit} className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-300 uppercase tracking-wider mb-1.5">
+                  Your Account Email
+                </label>
+                <input
+                  type="email"
+                  required
+                  value={authEmailInput}
+                  onChange={(e) => setAuthEmailInput(e.target.value)}
+                  placeholder="staff@djoyplus.com"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-emerald-500 transition"
+                />
+              </div>
+
+              <div className="flex items-center justify-between text-xs pt-1">
+                <button
+                  type="button"
+                  onClick={() => { setAuthView('login'); setAuthError(null); setAuthMessage(null); }}
+                  className="text-emerald-400 hover:underline"
+                >
+                  Back to Sign In
+                </button>
+              </div>
+
+              <button
+                type="submit"
+                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2.5 px-4 rounded-lg text-sm transition shadow-lg shadow-emerald-950/50 mt-2"
+              >
+                Send Reset Code
+              </button>
+            </form>
+          )}
+
+          {/* RESET PASSWORD VIEW */}
+          {authView === 'reset' && (
+            <form onSubmit={handleResetSubmit} className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-300 uppercase tracking-wider mb-1.5">
+                  6-Digit Reset Code
+                </label>
+                <input
+                  type="text"
+                  required
+                  maxLength={6}
+                  value={authCodeInput}
+                  onChange={(e) => setAuthCodeInput(e.target.value)}
+                  placeholder="123456"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2.5 text-center text-lg font-mono text-emerald-400 tracking-widest focus:outline-none focus:border-emerald-500 transition"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 uppercase tracking-wider mb-1.5">
+                  New Password
+                </label>
+                <input
+                  type="password"
+                  required
+                  maxLength={6}
+                  value={authPasswordInput}
+                  onChange={(e) => setAuthPasswordInput(e.target.value)}
+                  placeholder="6 chars (e.g. A1b2C3)"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-emerald-500 transition"
+                />
+                <p className="mt-1 text-[11px] text-slate-400">
+                  Must be exactly 6 alphanumeric characters including at least one letter and one number.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 uppercase tracking-wider mb-1.5">
+                  Confirm New Password
+                </label>
+                <input
+                  type="password"
+                  required
+                  maxLength={6}
+                  value={authConfirmPassword}
+                  onChange={(e) => setAuthConfirmPassword(e.target.value)}
+                  placeholder="Re-enter 6-char password"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2.5 text-sm text-white font-mono focus:outline-none focus:border-emerald-500 transition"
+                />
+              </div>
+
+              <button
+                type="submit"
+                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-2.5 px-4 rounded-lg text-sm transition shadow-lg shadow-emerald-950/50 mt-2"
+              >
+                Reset Password
+              </button>
+            </form>
+          )}
+
+          {/* PENDING APPROVAL VIEW */}
+          {authView === 'pending_approval' && (
+            <div className="space-y-4 text-center">
+              <div className="bg-amber-500/10 border border-amber-500/20 text-amber-300 p-4 rounded-xl text-xs space-y-2">
+                <p className="font-semibold text-white text-sm">Waiting for Administration Approval</p>
+                <p>Your email ({currentUser?.email || authEmailInput}) has been verified successfully. Because this app contains customer records, an administrator must approve your account before granting lead access.</p>
+              </div>
+
+              <button
+                onClick={handleLogout}
+                className="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium py-2.5 px-4 rounded-lg text-sm transition"
+              >
+                Sign Out / Return to Login
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
       {/* Top Navbar */}
@@ -656,45 +1276,44 @@ function createJsonResponse(obj) {
                   SheetFlow AI
                 </span>
                 <span className="text-xs bg-emerald-500/10 text-emerald-400 font-medium px-2 py-0.5 rounded-full border border-emerald-500/20">
-                  Fail-Closed Authentication
+                  {currentUser.role}
                 </span>
               </div>
               <p className="text-xs text-slate-400 hidden sm:block">
-                WhatsApp Inquiry Automation & Dashboard Cockpit
+                Signed in as <strong className="text-white">{currentUser.email}</strong>
               </p>
             </div>
           </div>
 
           <div className="flex items-center space-x-3">
-            {/* Staff Token Input */}
-            <div className="hidden lg:flex items-center space-x-2 bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5">
-              <Key className="w-3.5 h-3.5 text-amber-400" />
-              <span className="text-xs text-slate-400 font-medium">Staff Token:</span>
-              <input
-                type="password"
-                value={staffToken}
-                onChange={(e) => handleSaveToken(e.target.value)}
-                placeholder="Enter STAFF_API_KEY"
-                className="bg-transparent text-xs text-white font-mono focus:outline-none w-32"
-              />
-            </div>
-
             <button
               onClick={() => setActiveTab('webhook')}
-              className="inline-flex items-center space-x-2 bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 py-2 rounded-lg text-sm font-medium transition shadow-sm"
+              className="hidden md:inline-flex items-center space-x-2 bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 py-2 rounded-lg text-sm font-medium transition shadow-sm"
             >
               <Webhook className="w-4 h-4" />
-              <span className="hidden sm:inline">Webhook Sandbox</span>
+              <span>Webhook Sandbox</span>
             </button>
-            {dataMode === 'demo' && (
+
+            {currentUser.role === 'Administration' && (
               <button
-                onClick={handleResetData}
-                title="Reset Demo Inquiries"
-                className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
+                onClick={() => setActiveTab('admin')}
+                className={`inline-flex items-center space-x-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition ${
+                  activeTab === 'admin' ? 'bg-purple-600 text-white' : 'bg-slate-800 hover:bg-slate-700 text-slate-200'
+                }`}
               >
-                <RefreshCw className="w-4 h-4" />
+                <Users className="w-4 h-4" />
+                <span>Manage Accounts</span>
               </button>
             )}
+
+            <button
+              onClick={handleLogout}
+              title="Sign Out"
+              className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition flex items-center space-x-1.5 px-3 text-xs font-medium"
+            >
+              <LogOut className="w-4 h-4" />
+              <span className="hidden sm:inline">Sign Out</span>
+            </button>
           </div>
         </div>
 
@@ -759,24 +1378,6 @@ function createJsonResponse(obj) {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8">
-        {!staffToken && (
-          <div className="mb-6 bg-amber-500/10 border border-amber-500/20 text-amber-300 p-4 rounded-xl text-sm flex items-center justify-between">
-            <div className="flex items-center space-x-2">
-              <Key className="w-5 h-5 text-amber-400" />
-              <span><strong>Staff Token Required:</strong> Please enter your configured <code className="font-mono text-amber-200">STAFF_API_KEY</code> in the top navigation bar to access inquiries.</span>
-            </div>
-            <button
-              onClick={() => {
-                const token = prompt('Enter STAFF_API_KEY:');
-                if (token) handleSaveToken(token);
-              }}
-              className="bg-amber-600 hover:bg-amber-500 text-white px-3 py-1.5 rounded text-xs font-medium transition"
-            >
-              Enter Token
-            </button>
-          </div>
-        )}
-
         {errorMsg && (
           <div className="mb-6 bg-red-500/10 border border-red-500/20 text-red-400 p-4 rounded-xl text-sm flex items-center justify-between">
             <div className="flex items-center space-x-2">
@@ -802,6 +1403,91 @@ function createJsonResponse(obj) {
           </div>
         ) : (
           <>
+            {/* ADMIN USERS TAB */}
+            {activeTab === 'admin' && currentUser.role === 'Administration' && (
+              <div className="space-y-6 animate-fadeIn">
+                <div>
+                  <h1 className="text-2xl font-bold text-white tracking-tight">Staff Account Management</h1>
+                  <p className="text-sm text-slate-400">Approve registrations, disable accounts, and assign roles (Administration only)</p>
+                </div>
+
+                <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-sm">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                      <thead>
+                        <tr className="border-b border-slate-800 text-xs text-slate-400 uppercase tracking-wider">
+                          <th className="p-4">Email</th>
+                          <th className="p-4">Role</th>
+                          <th className="p-4">Verified</th>
+                          <th className="p-4">Approved</th>
+                          <th className="p-4">Status</th>
+                          <th className="p-4 text-right">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/60 font-sans">
+                        {adminUsers.map((u, idx) => (
+                          <tr key={idx} className="hover:bg-slate-800/30 transition">
+                            <td className="p-4 font-mono text-white font-medium">{u.email}</td>
+                            <td className="p-4">
+                              <select
+                                value={u.role}
+                                onChange={(e) => handleAdminRoleChange(u.email, e.target.value)}
+                                className="bg-slate-950 border border-slate-800 rounded px-2.5 py-1 text-xs text-white focus:outline-none focus:border-purple-500"
+                              >
+                                <option value="Administration">Administration</option>
+                                <option value="Manager">Manager</option>
+                                <option value="Employee">Employee</option>
+                              </select>
+                            </td>
+                            <td className="p-4">
+                              <span className={`px-2 py-0.5 rounded text-xs font-semibold ${u.isVerified ? 'bg-emerald-500/10 text-emerald-400' : 'bg-amber-500/10 text-amber-400'}`}>
+                                {u.isVerified ? 'Verified' : 'Unverified'}
+                              </span>
+                            </td>
+                            <td className="p-4">
+                              <span className={`px-2 py-0.5 rounded text-xs font-semibold ${u.isApproved ? 'bg-emerald-500/10 text-emerald-400' : 'bg-amber-500/10 text-amber-400'}`}>
+                                {u.isApproved ? 'Approved' : 'Pending Approval'}
+                              </span>
+                            </td>
+                            <td className="p-4">
+                              <span className={`px-2 py-0.5 rounded text-xs font-semibold ${u.isActive ? 'bg-emerald-500/10 text-emerald-400' : 'bg-red-500/10 text-red-400'}`}>
+                                {u.isActive ? 'Active' : 'Disabled'}
+                              </span>
+                            </td>
+                             <td className="p-4 text-right space-x-2">
+                              {!u.isApproved && (
+                                <button
+                                  onClick={() => handleAdminStatusChange(u.email, true, !!u.isActive)}
+                                  className="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1 rounded text-xs font-medium transition"
+                                >
+                                  Approve
+                                </button>
+                              )}
+                              {u.isActive ? (
+                                <button
+                                  onClick={() => handleAdminStatusChange(u.email, !!u.isApproved, false)}
+                                  className="bg-red-600/20 hover:bg-red-600/30 text-red-400 border border-red-500/30 px-3 py-1 rounded text-xs font-medium transition"
+                                >
+                                  Disable
+                                </button>
+                              ) : (
+                                <button
+                                  onClick={() => handleAdminStatusChange(u.email, !!u.isApproved, true)}
+                                  className="bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-400 border border-emerald-500/30 px-3 py-1 rounded text-xs font-medium transition"
+                                >
+                                  Enable
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* 1. DASHBOARD TAB */}
             {activeTab === 'dashboard' && (
               <div className="space-y-6 animate-fadeIn">
@@ -816,15 +1502,20 @@ function createJsonResponse(obj) {
                       </span>
                     </div>
                     <p className="text-sm text-slate-400">
-                      {dataMode === 'live' ? 'Live leads fetched directly from Google Sheets source of truth.' : 'Safe in-memory sandbox for testing webhook presets.'}
+                      Role: <strong className="text-white">{currentUser.role}</strong> {currentUser.role === 'Employee' ? '(Showing only assigned leads)' : '(Showing all leads)'}
                     </p>
                   </div>
                   
                   <div className="flex items-center space-x-3">
-                    <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                      <span className="w-2 h-2 rounded-full bg-emerald-400 mr-2 animate-pulse"></span>
-                      Fail-Closed Storage Sync
-                    </span>
+                    {(currentUser.role === 'Administration' || currentUser.role === 'Manager') && (
+                      <a
+                        href={`/api/inquiries/export?mode=${dataMode}`}
+                        className="inline-flex items-center space-x-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 text-xs font-medium transition"
+                      >
+                        <Download className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Export Leads CSV</span>
+                      </a>
+                    )}
                     <button
                       onClick={() => setActiveTab('webhook')}
                       className="inline-flex items-center space-x-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 transition"
@@ -1042,25 +1733,15 @@ function createJsonResponse(obj) {
                           </select>
                         </div>
 
-                        <button
-                          onClick={() => {
-                            const csvContent = "data:text/csv;charset=utf-8," + 
-                              ["Date,Timestamp,Inquiry_ID,Customer_Name,Phone_Number,Source_Campaign,Message_Summary,Agent_Assigned,Status",
-                              ...filteredInquiries.map(i => `"${i.date}","${i.timestamp}","${i.inquiryId}","${i.customerName}","${i.phoneNumber}","${i.sourceCampaign}","${i.messageSummary.replace(/"/g, '""')}","${i.agentAssigned}","${i.status}"`)
-                              ].join("\n");
-                            const encodedUri = encodeURI(csvContent);
-                            const link = document.createElement("a");
-                            link.setAttribute("href", encodedUri);
-                            link.setAttribute("download", `Raw_Inquiries_${dataMode}.csv`);
-                            document.body.appendChild(link);
-                            link.click();
-                            document.body.removeChild(link);
-                          }}
-                          className="inline-flex items-center space-x-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition"
-                        >
-                          <Download className="w-4 h-4" />
-                          <span>Export CSV</span>
-                        </button>
+                        {(currentUser.role === 'Administration' || currentUser.role === 'Manager') && (
+                          <a
+                            href={`/api/inquiries/export?mode=${dataMode}`}
+                            className="inline-flex items-center space-x-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition"
+                          >
+                            <Download className="w-4 h-4 text-emerald-400" />
+                            <span>Export CSV</span>
+                          </a>
+                        )}
                       </div>
                     </div>
 
@@ -1204,7 +1885,7 @@ function createJsonResponse(obj) {
                         <Webhook className="w-4 h-4 text-emerald-400" />
                         <span>Select CRM Preset</span>
                       </h2>
-                      <span className="text-xs text-slate-400 font-mono">Authenticated via /api/simulator/send</span>
+                      <span className="text-xs text-slate-400 font-mono">Authenticated via session</span>
                     </div>
 
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -1230,7 +1911,7 @@ function createJsonResponse(obj) {
 
                     <div className="space-y-2">
                       <label className="text-xs font-medium text-slate-300 uppercase tracking-wider">
-                        JSON Payload Editor (Supports status-only updates & literal text preservation)
+                        JSON Payload Editor
                       </label>
                       <textarea
                         rows={10}
@@ -1259,7 +1940,7 @@ function createJsonResponse(obj) {
                     </button>
                   </div>
 
-                  {/* Right: Response Inspector & Instructions */}
+                  {/* Right: Response Inspector */}
                   <div className="space-y-6">
                     <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
                       <h2 className="text-base font-bold text-white flex items-center space-x-2">
@@ -1277,9 +1958,6 @@ function createJsonResponse(obj) {
                             }`}>
                               Status: {webhookResponse.status}
                             </span>
-                            {webhookResponse.code && (
-                              <span className="text-xs font-mono text-slate-400">Code: {webhookResponse.code}</span>
-                            )}
                           </div>
                           <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 overflow-x-auto">
                             <pre className="text-xs font-mono text-emerald-300">
@@ -1289,19 +1967,9 @@ function createJsonResponse(obj) {
                         </div>
                       ) : (
                         <div className="text-center py-12 text-slate-500 text-sm">
-                          Click "Simulate Webhook Delivery" to test payload parsing, strict status validation, and field preservation.
+                          Click "Simulate Webhook Delivery" to test payload parsing and deduplication.
                         </div>
                       )}
-                    </div>
-
-                    <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm space-y-3">
-                      <h3 className="text-sm font-bold text-white flex items-center space-x-2">
-                        <Lock className="w-4 h-4 text-teal-400" />
-                        <span>Live Production Webhook Endpoint</span>
-                      </h3>
-                      <p className="text-xs text-slate-300 leading-relaxed">
-                        For live WhatsApp traffic, configure your CRM to call <code className="text-emerald-400 font-mono">POST /api/webhook/whatsapp</code> with header <code className="text-emerald-400 font-mono">X-Webhook-Secret: YOUR_WHATSAPP_WEBHOOK_SECRET</code>. URL query parameters are rejected.
-                      </p>
                     </div>
                   </div>
                 </div>
@@ -1371,46 +2039,48 @@ function createJsonResponse(obj) {
                   </div>
                 </div>
 
-                {/* Migration Section */}
-                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <h2 className="text-base font-bold text-white flex items-center space-x-2">
-                        <DatabaseBackup className="w-4 h-4 text-teal-400" />
-                        <span>Legacy Live Records Migration Tool</span>
-                      </h2>
-                      <p className="text-xs text-slate-400">Safely migrate historical records preserving original dates, timestamps, and IDs from private <code className="text-emerald-400 font-mono">data/live_inquiries.json</code></p>
+                {/* Migration Section (Admin only) */}
+                {currentUser.role === 'Administration' && (
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h2 className="text-base font-bold text-white flex items-center space-x-2">
+                          <DatabaseBackup className="w-4 h-4 text-teal-400" />
+                          <span>Legacy Live Records Migration Tool</span>
+                        </h2>
+                        <p className="text-xs text-slate-400">Safely migrate historical records preserving original dates, timestamps, and IDs (Administration only)</p>
+                      </div>
+                      <div className="flex space-x-2">
+                        <button
+                          onClick={() => handleRunMigration(true)}
+                          disabled={isMigrating}
+                          className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-xs font-semibold transition"
+                        >
+                          Run Migration Dry Run
+                        </button>
+                        <button
+                          onClick={() => {
+                            if (confirm('Execute live migration into Google Sheets?')) {
+                              handleRunMigration(false);
+                            }
+                          }}
+                          disabled={isMigrating}
+                          className="bg-teal-600 hover:bg-teal-500 text-white px-3 py-2 rounded-lg text-xs font-semibold transition"
+                        >
+                          Execute Live Migration
+                        </button>
+                      </div>
                     </div>
-                    <div className="flex space-x-2">
-                      <button
-                        onClick={() => handleRunMigration(true)}
-                        disabled={isMigrating}
-                        className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-xs font-semibold transition"
-                      >
-                        Run Migration Dry Run
-                      </button>
-                      <button
-                        onClick={() => {
-                          if (confirm('Execute live migration into Google Sheets?')) {
-                            handleRunMigration(false);
-                          }
-                        }}
-                        disabled={isMigrating}
-                        className="bg-teal-600 hover:bg-teal-500 text-white px-3 py-2 rounded-lg text-xs font-semibold transition"
-                      >
-                        Execute Live Migration
-                      </button>
-                    </div>
-                  </div>
 
-                  {migrationResult && (
-                    <div className="bg-slate-950 border border-slate-800 rounded-lg p-3">
-                      <pre className="text-xs font-mono text-teal-300">
-                        {JSON.stringify(migrationResult, null, 2)}
-                      </pre>
-                    </div>
-                  )}
-                </div>
+                    {migrationResult && (
+                      <div className="bg-slate-950 border border-slate-800 rounded-lg p-3">
+                        <pre className="text-xs font-mono text-teal-300">
+                          {JSON.stringify(migrationResult, null, 2)}
+                        </pre>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {/* Code Preview Box */}
                 <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-sm">
@@ -1424,21 +2094,6 @@ function createJsonResponse(obj) {
                     </pre>
                   </div>
                 </div>
-
-                {/* Deployment Steps Summary */}
-                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm space-y-3">
-                  <h3 className="text-sm font-bold text-white flex items-center space-x-2">
-                    <BookOpen className="w-4 h-4 text-emerald-400" />
-                    <span>Accurate Setup & Deployment Guide</span>
-                  </h3>
-                  <ol className="list-decimal list-inside space-y-2 text-xs text-slate-300">
-                    <li>Create a Google Sheet with tabs <strong className="text-white">Raw_Inquiries</strong> and <strong className="text-white">Daily_Summary</strong>. Copy your Spreadsheet ID.</li>
-                    <li>Open <strong className="text-white">Extensions &gt; Apps Script</strong>, paste the maintained receiver code above into <code className="text-emerald-400 font-mono">Code.gs</code>.</li>
-                    <li>Go to <strong className="text-white">Project Settings (Gear icon) &gt; Script Properties</strong>, add distinct properties <code className="text-emerald-400 font-mono">APPS_SCRIPT_READ_SECRET</code> and <code className="text-emerald-400 font-mono">APPS_SCRIPT_WRITE_SECRET</code>. Do not reuse your CRM webhook secret here.</li>
-                    <li>Click <strong className="text-white">Deploy &gt; New deployment</strong> &gt; Web app (Execute as: <strong className="text-white">Me</strong>, Who has access: <strong className="text-white">Anyone</strong>). Copy the Web App URL into <code className="text-emerald-400 font-mono">APPS_SCRIPT_WEB_APP_URL</code> in your server environment.</li>
-                    <li>Configure your WhatsApp CRM webhook to send to your Express backend (<code className="text-emerald-400 font-mono">POST /api/webhook/whatsapp</code>) with header <code className="text-emerald-400 font-mono">X-Webhook-Secret: YOUR_WHATSAPP_WEBHOOK_SECRET</code>.</li>
-                  </ol>
-                </div>
               </div>
             )}
 
@@ -1450,15 +2105,7 @@ function createJsonResponse(obj) {
                   <p className="text-sm text-slate-400">Privacy-sanitized Gemini AI mapper for generating custom Apps Script extraction logic</p>
                 </div>
 
-                <div className="bg-amber-500/10 border border-amber-500/20 text-amber-300 p-4 rounded-xl text-xs flex items-start space-x-3">
-                  <Shield className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
-                  <div>
-                    <strong className="font-semibold text-white">Privacy Protection Notice:</strong> Before sending sample JSON payloads to Gemini, customer names, phone numbers, emails, and sensitive keys are automatically anonymized on the server while preserving nesting, field names, arrays, and data types.
-                  </div>
-                </div>
-
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                  {/* Input Form */}
                   <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
                     <h2 className="text-base font-bold text-white flex items-center space-x-2">
                       <Bot className="w-4 h-4 text-purple-400" />
@@ -1508,7 +2155,6 @@ function createJsonResponse(obj) {
                     </button>
                   </div>
 
-                  {/* AI Output Analysis */}
                   <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
                     <h2 className="text-base font-bold text-white flex items-center space-x-2">
                       <Code className="w-4 h-4 text-emerald-400" />
@@ -1552,27 +2198,17 @@ function createJsonResponse(obj) {
 
                 <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 sm:p-8 space-y-6 text-slate-300 leading-relaxed text-sm">
                   <div className="border-b border-slate-800 pb-4">
-                    <h2 className="text-xl font-bold text-white mb-2">1. Fail-Closed Authentication & Distinct Secrets</h2>
+                    <h2 className="text-xl font-bold text-white mb-2">1. Email-Based Staff Authentication & Roles</h2>
                     <p className="text-slate-400">
-                      Express uses <code className="text-emerald-400 font-mono">APPS_SCRIPT_READ_SECRET</code> exclusively for reads and <code className="text-emerald-400 font-mono">APPS_SCRIPT_WRITE_SECRET</code> exclusively for writes. The CRM webhook uses <code className="text-emerald-400 font-mono">WHATSAPP_WEBHOOK_SECRET</code> via header <code className="text-emerald-400 font-mono">X-Webhook-Secret</code>. Apps Script fails closed if credentials do not match exactly.
+                      Individual staff accounts with email verification, 6-character alphanumeric passwords, admin approval workflows, and role permissions (Administration, Manager, Employee).
                     </p>
                   </div>
 
                   <div className="border-b border-slate-800 pb-4">
-                    <h2 className="text-xl font-bold text-white mb-2">2. Status-Only Updates & Field Preservation</h2>
+                    <h2 className="text-xl font-bold text-white mb-2">2. Fail-Closed Authentication & Distinct Secrets</h2>
                     <p className="text-slate-400">
-                      Follow-up updates that only supply status leave earlier message and agent cells untouched (preserving messages starting with `=`). Incoming text and phone numbers are written as literal text.
+                      Express uses <code className="text-emerald-400 font-mono">APPS_SCRIPT_READ_SECRET</code> exclusively for reads and <code className="text-emerald-400 font-mono">APPS_SCRIPT_WRITE_SECRET</code> exclusively for writes. The CRM webhook uses <code className="text-emerald-400 font-mono">WHATSAPP_WEBHOOK_SECRET</code> via header <code className="text-emerald-400 font-mono">X-Webhook-Secret</code>.
                     </p>
-                  </div>
-
-                  <div>
-                    <h2 className="text-xl font-bold text-white mb-2">3. Supported CRM Presets</h2>
-                    <ul className="list-disc list-inside space-y-1 text-slate-300">
-                      <li><strong>ManyChat:</strong> `contact.name`, `contact.phone`</li>
-                      <li><strong>Wati:</strong> `name`, `phone`</li>
-                      <li><strong>Respond.io:</strong> `contact.full_name`, `contact.phone`</li>
-                      <li><strong>SleekFlow:</strong> `customer.full_name`, `customer.phone`</li>
-                    </ul>
                   </div>
                 </div>
               </div>
@@ -1583,7 +2219,7 @@ function createJsonResponse(obj) {
 
       {/* Footer */}
       <footer className="bg-slate-900 border-t border-slate-800 py-4 text-center text-xs text-slate-500">
-        <p>WhatsApp Sheets Automation Hub • Fail-Closed Authentication Edition</p>
+        <p>WhatsApp Sheets Automation Hub • Email Authentication & Role Permissions Edition</p>
       </footer>
     </div>
   );
