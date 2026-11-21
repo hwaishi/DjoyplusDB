@@ -5,15 +5,86 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
+import cookieParser from 'cookie-parser';
+import Database from 'better-sqlite3';
 import { GoogleGenAI } from '@google/genai';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const DATA_DIR = path.resolve(__dirname, 'data');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const CODES_FILE = path.join(DATA_DIR, 'verification_codes.json');
-const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
-const LEGACY_JSON_FILE = path.join(DATA_DIR, 'live_inquiries.json');
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+const DB_FILE = path.join(DATA_DIR, 'djoyplus.db');
+const db = new Database(DB_FILE);
+db.pragma('journal_mode = WAL');
+
+// Initialize database schema
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    email TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    role TEXT NOT NULL,
+    is_verified INTEGER NOT NULL,
+    is_approved INTEGER NOT NULL,
+    is_active INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS codes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    code_digest TEXT NOT NULL,
+    type TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    csrf_token TEXT NOT NULL
+  );
+`);
+
+// Migrate legacy JSON files if they exist and DB is empty
+const userCount = db.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt: number };
+if (userCount.cnt === 0) {
+  const USERS_FILE = path.join(DATA_DIR, 'users.json');
+  if (fs.existsSync(USERS_FILE)) {
+    try {
+      const legacyUsers = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'));
+      const insertUser = db.prepare(`
+        INSERT OR IGNORE INTO users (email, password_hash, salt, role, is_verified, is_approved, is_active, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const tx = db.transaction((users) => {
+        for (const u of users) {
+          insertUser.run(
+            u.email,
+            u.passwordHash || u.password_hash,
+            u.salt,
+            u.role,
+            u.isVerified ? 1 : (u.is_verified ? 1 : 0),
+            u.isApproved ? 1 : (u.is_approved ? 1 : 0),
+            u.isActive !== false ? 1 : 0,
+            u.createdAt || new Date().toISOString()
+          );
+        }
+      });
+      tx(legacyUsers);
+      console.log('Migrated legacy users.json to SQLite');
+    } catch (e) {
+      console.error('Error migrating users.json:', e);
+    }
+  }
+}
+
+const CODE_SECRET = process.env.CODE_SECRET || crypto.randomBytes(32).toString('hex');
 
 // Rate limiter for Gemini requests
 const geminiRateLimiter = (() => {
@@ -31,36 +102,6 @@ const geminiRateLimiter = (() => {
     next();
   };
 })();
-
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-}
-
-interface UserRecord {
-  email: string;
-  passwordHash: string;
-  salt: string;
-  role: 'Administration' | 'Manager' | 'Employee';
-  isVerified: boolean;
-  isApproved: boolean;
-  isActive: boolean;
-  createdAt: string;
-}
-
-interface CodeRecord {
-  email: string;
-  code: string;
-  type: 'verify' | 'reset';
-  expiresAt: number;
-  attempts: number;
-  createdAt: number;
-}
-
-interface SessionRecord {
-  sessionId: string;
-  email: string;
-  expiresAt: number;
-}
 
 interface InquiryRecord {
   date: string;
@@ -84,7 +125,7 @@ let demoInquiries: InquiryRecord[] = [
     phoneNumber: '+15552348901',
     sourceCampaign: 'Meta_FB_Promo_Nov',
     messageSummary: 'Inquired about pricing and availability for the enterprise tier.',
-    agentAssigned: 'Alex Tan',
+    agentAssigned: 'employee1@djoyplus.com',
     status: 'Qualified'
   },
   {
@@ -95,56 +136,10 @@ let demoInquiries: InquiryRecord[] = [
     phoneNumber: '+15559876543',
     sourceCampaign: 'Google_Search_Brand',
     messageSummary: 'Asked for onboarding documentation and setup guide.',
-    agentAssigned: 'Jessica Lee',
+    agentAssigned: 'employee2@djoyplus.com',
     status: 'Closed'
   }
 ];
-
-// Durable storage helpers
-function loadUsers(): UserRecord[] {
-  try {
-    if (fs.existsSync(USERS_FILE)) {
-      return JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'));
-    }
-  } catch (err) {
-    console.error('Error loading users:', err);
-  }
-  return [];
-}
-
-function saveUsers(users: UserRecord[]): void {
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf-8');
-}
-
-function loadCodes(): CodeRecord[] {
-  try {
-    if (fs.existsSync(CODES_FILE)) {
-      return JSON.parse(fs.readFileSync(CODES_FILE, 'utf-8'));
-    }
-  } catch (err) {
-    console.error('Error loading codes:', err);
-  }
-  return [];
-}
-
-function saveCodes(codes: CodeRecord[]): void {
-  fs.writeFileSync(CODES_FILE, JSON.stringify(codes, null, 2), 'utf-8');
-}
-
-function loadSessions(): SessionRecord[] {
-  try {
-    if (fs.existsSync(SESSIONS_FILE)) {
-      return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf-8'));
-    }
-  } catch (err) {
-    console.error('Error loading sessions:', err);
-  }
-  return [];
-}
-
-function saveSessions(sessions: SessionRecord[]): void {
-  fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2), 'utf-8');
-}
 
 // Password hashing with crypto.scryptSync
 function hashPassword(password: string, existingSalt?: string): { passwordHash: string; salt: string } {
@@ -169,41 +164,30 @@ function normalizeEmail(email: string): string {
   return (email || '').trim().toLowerCase();
 }
 
-// Email Transporter setup
+// Email Transporter setup (Requirement 2: No silent fallback to local file)
 function getEmailTransporter() {
   const host = process.env.SMTP_HOST;
   const port = parseInt(process.env.SMTP_PORT || '587', 10);
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
 
-  if (host && user && pass) {
-    return nodemailer.createTransport({
-      host,
-      port,
-      secure: port === 465,
-      auth: { user, pass }
-    });
+  if (!host || !user || !pass) {
+    return null;
   }
 
-  // Fallback test transporter (ethereal or stub transport that logs to console and stores in data/sent_emails.json)
-  return {
-    sendMail: async (mailOptions: { to: string; subject: string; text: string; html?: string }) => {
-      console.log('--- SIMULATED EMAIL SENT ---');
-      console.log(`To: ${mailOptions.to}`);
-      console.log(`Subject: ${mailOptions.subject}`);
-      console.log(`Body:\n${mailOptions.text}`);
-      console.log('----------------------------');
-      const sentLogFile = path.join(DATA_DIR, 'sent_emails.json');
-      const logs = fs.existsSync(sentLogFile) ? JSON.parse(fs.readFileSync(sentLogFile, 'utf-8')) : [];
-      logs.push({ ...mailOptions, sentAt: new Date().toISOString() });
-      fs.writeFileSync(sentLogFile, JSON.stringify(logs, null, 2), 'utf-8');
-      return { messageId: 'simulated-' + Date.now() };
-    }
-  };
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465,
+    auth: { user, pass }
+  });
 }
 
 async function sendTransactionalEmail(to: string, subject: string, text: string) {
   const transporter = getEmailTransporter();
+  if (!transporter) {
+    throw new Error('SMTP email transport is not configured. Please configure SMTP environment variables.');
+  }
   const from = process.env.SMTP_FROM || 'D\' Joy Plus <noreply@djoyplus.com>';
   await transporter.sendMail({
     from,
@@ -228,84 +212,46 @@ function checkRateLimit(key: string, limit: number, windowMs: number): boolean {
   return true;
 }
 
-// Get current date & timestamp in Asia/Kuala_Lumpur
-function getMalaysiaDateTime() {
-  const now = new Date();
-  const formatterDate = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Kuala_Lumpur',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  });
-  const formatterTime = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Asia/Kuala_Lumpur',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false
-  });
-  const dateStr = formatterDate.format(now);
-  const timeStr = formatterTime.format(now);
-  return { dateStr, timestampStr: `${dateStr} ${timeStr}` };
-}
-
-// Gemini sanitization for privacy
-function sanitizeJsonForAi(obj: any): any {
-  if (obj === null || obj === undefined) return obj;
-  if (typeof obj !== 'object') {
-    if (typeof obj === 'string') {
-      if (obj.match(/^[+\d\s()-]+$/)) return '+15550000000';
-      if (obj.includes('@')) return 'user@example.com';
-      return 'Sample text';
-    }
-    if (typeof obj === 'number') return 123;
-    if (typeof obj === 'boolean') return true;
-    return obj;
-  }
-  if (Array.isArray(obj)) {
-    return obj.slice(0, 2).map(item => sanitizeJsonForAi(item));
-  }
-  const sanitized: Record<string, any> = {};
-  for (const [key, value] of Object.entries(obj)) {
-    const lowerKey = key.toLowerCase();
-    if (lowerKey.includes('secret') || lowerKey.includes('token') || lowerKey.includes('key') || lowerKey.includes('password') || lowerKey.includes('auth')) {
-      sanitized[key] = '[REDACTED]';
-    } else {
-      sanitized[key] = sanitizeJsonForAi(value);
-    }
-  }
-  return sanitized;
-}
-
-// Session authentication middleware
+// Session authentication middleware with CSRF protection
 const requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader?.replace('Bearer ', '') || req.headers['x-session-token'];
+  const sessionId = req.cookies?.sessionId || req.headers['x-session-token'];
   
-  if (!token || typeof token !== 'string') {
+  if (!sessionId || typeof sessionId !== 'string') {
     return res.status(401).json({ success: false, error: 'Authentication required. Please sign in.' });
   }
 
-  const sessions = loadSessions();
   const now = Date.now();
-  const session = sessions.find(s => s.sessionId === token && s.expiresAt > now);
+  const session = db.prepare('SELECT * FROM sessions WHERE session_id = ? AND expires_at > ?').get(sessionId, now) as any;
 
   if (!session) {
     return res.status(401).json({ success: false, error: 'Session expired or invalid.' });
   }
 
-  const users = loadUsers();
-  const user = users.find(u => u.email === session.email);
+  // CSRF protection for state-changing routes
+  if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method)) {
+    const clientCsrf = req.headers['x-csrf-token'];
+    if (!clientCsrf || clientCsrf !== session.csrf_token) {
+      return res.status(403).json({ success: false, error: 'CSRF token missing or invalid.' });
+    }
+  }
 
-  if (!user || !user.isActive) {
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(session.email) as any;
+
+  if (!user || !user.is_active) {
     return res.status(401).json({ success: false, error: 'Account disabled or not found.' });
   }
 
-  if (!user.isVerified || !user.isApproved) {
+  if (!user.is_verified || !user.is_approved) {
     return res.status(403).json({ success: false, error: 'Account pending email verification or administration approval.' });
   }
 
-  (req as any).user = user;
+  (req as any).user = {
+    email: user.email,
+    role: user.role,
+    isVerified: !!user.is_verified,
+    isApproved: !!user.is_approved,
+    isActive: !!user.is_active
+  };
   next();
 };
 
@@ -341,6 +287,7 @@ const verifyWebhookSecret = (req: express.Request, res: express.Response, next: 
 async function startServer() {
   const app = express();
   app.use(express.json());
+  app.use(cookieParser());
 
   // --- Auth API Routes ---
 
@@ -367,48 +314,59 @@ async function startServer() {
         return res.status(429).json({ success: false, error: 'Too many signup attempts. Please try again later.' });
       }
 
-      const users = loadUsers();
-      if (users.some(u => u.email === email)) {
+      const existingUser = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
+      if (existingUser) {
+        if (!existingUser.is_verified) {
+          // Allow requesting new verification code if unverified
+          const rawCode = String(crypto.randomInt(100000, 1000000));
+          const codeDigest = crypto.createHmac('sha256', CODE_SECRET).update(rawCode).digest('hex');
+          
+          db.prepare('DELETE FROM codes WHERE email = ? AND type = ?').run(email, 'verify');
+          db.prepare('INSERT INTO codes (email, code_digest, type, expires_at, attempts, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+            .run(email, codeDigest, 'verify', Date.now() + 10 * 60 * 1000, 0, Date.now());
+
+          try {
+            await sendTransactionalEmail(email, "Verify your D' Joy Plus account", `Your verification code is: ${rawCode}\n\nThis code expires in 10 minutes.`);
+          } catch (emailErr: any) {
+            console.error('Email delivery error:', emailErr);
+            return res.status(500).json({ success: false, error: 'Account exists but verification email delivery failed: ' + emailErr.message });
+          }
+
+          return res.json({ success: true, message: 'Account already exists but is unverified. A new verification code has been sent.' });
+        }
         return res.status(400).json({ success: false, error: 'An account with this email already exists.' });
       }
 
       const { passwordHash, salt } = hashPassword(password);
-      const adminSetupEmail = normalizeEmail(process.env.ADMIN_SETUP_EMAIL || 'admin@djoyplus.com');
-      const isFirstAdmin = email === adminSetupEmail;
+      const adminSetupEmail = normalizeEmail(process.env.ADMIN_SETUP_EMAIL || '');
+      const isFirstAdmin = adminSetupEmail !== '' && email === adminSetupEmail;
 
-      const newUser: UserRecord = {
-        email,
-        passwordHash,
-        salt,
-        role: isFirstAdmin ? 'Administration' : 'Employee',
-        isVerified: false,
-        isApproved: isFirstAdmin ? true : false, // First setup admin is pre-approved upon email verification
-        isActive: true,
-        createdAt: new Date().toISOString()
-      };
+      const role = isFirstAdmin ? 'Administration' : 'Employee';
+      const isApproved = isFirstAdmin ? 1 : 0; // First admin is approved upon verification
 
-      users.push(newUser);
-      saveUsers(users);
+      db.prepare(`
+        INSERT INTO users (email, password_hash, salt, role, is_verified, is_approved, is_active, created_at)
+        VALUES (?, ?, ?, ?, 0, ?, 1, ?)
+      `).run(email, passwordHash, salt, role, isApproved, new Date().toISOString());
 
-      // Generate 6-digit verification code
-      const code = String(Math.floor(100000 + Math.random() * 900000));
-      const codes = loadCodes().filter(c => !(c.email === email && c.type === 'verify'));
-      codes.push({
-        email,
-        code,
-        type: 'verify',
-        expiresAt: Date.now() + 10 * 60 * 1000,
-        attempts: 0,
-        createdAt: Date.now()
-      });
-      saveCodes(codes);
+      // Generate 6-digit verification code with HMAC digest
+      const rawCode = String(crypto.randomInt(100000, 1000000));
+      const codeDigest = crypto.createHmac('sha256', CODE_SECRET).update(rawCode).digest('hex');
 
-      // Send verification email
-      await sendTransactionalEmail(
-        email,
-        "Verify your D' Joy Plus account",
-        `Your verification code is: ${code}\n\nThis code expires in 10 minutes.`
-      );
+      db.prepare('DELETE FROM codes WHERE email = ? AND type = ?').run(email, 'verify');
+      db.prepare('INSERT INTO codes (email, code_digest, type, expires_at, attempts, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(email, codeDigest, 'verify', Date.now() + 10 * 60 * 1000, 0, Date.now());
+
+      try {
+        await sendTransactionalEmail(
+          email,
+          "Verify your D' Joy Plus account",
+          `Your verification code is: ${rawCode}\n\nThis code expires in 10 minutes.`
+        );
+      } catch (emailErr: any) {
+        console.error('Email delivery error:', emailErr);
+        return res.status(500).json({ success: false, error: 'Account created, but verification email delivery failed: ' + emailErr.message });
+      }
 
       res.json({ success: true, message: 'Account created. Please check your email for the verification code.' });
     } catch (err: any) {
@@ -417,13 +375,13 @@ async function startServer() {
     }
   });
 
-  // Verify Email Code
+  // Verify Email Code (Requirement 3: Atomic check, digest verification, max 5 attempts, grant first admin if matched)
   app.post('/api/auth/verify', async (req, res) => {
     try {
       const email = normalizeEmail(req.body.email);
-      const code = (req.body.code || '').trim();
+      const codeInput = (req.body.code || '').trim();
 
-      if (!email || !code) {
+      if (!email || !codeInput) {
         return res.status(400).json({ success: false, error: 'Email and verification code are required.' });
       }
 
@@ -431,44 +389,53 @@ async function startServer() {
         return res.status(429).json({ success: false, error: 'Too many verification attempts. Please request a new code.' });
       }
 
-      const codes = loadCodes();
-      const codeRecord = codes.find(c => c.email === email && c.type === 'verify');
+      const verifyTx = db.transaction(() => {
+        const codeRecord = db.prepare('SELECT * FROM codes WHERE email = ? AND type = ?').get(email, 'verify') as any;
 
-      if (!codeRecord || codeRecord.expiresAt < Date.now()) {
-        return res.status(400).json({ success: false, error: 'Invalid or expired verification code.' });
-      }
+        if (!codeRecord || codeRecord.expires_at < Date.now()) {
+          throw new Error('Invalid or expired verification code.');
+        }
 
-      if (codeRecord.attempts >= 5) {
-        return res.status(400).json({ success: false, error: 'Maximum attempts exceeded for this code. Please request a new one.' });
-      }
+        if (codeRecord.attempts >= 5) {
+          db.prepare('DELETE FROM codes WHERE id = ?').run(codeRecord.id);
+          throw new Error('Maximum attempts exceeded for this code. Please request a new one.');
+        }
 
-      if (codeRecord.code !== code) {
-        codeRecord.attempts += 1;
-        saveCodes(codes);
-        return res.status(400).json({ success: false, error: 'Incorrect verification code.' });
-      }
+        const isValid = crypto.timingSafeEqual(
+          Buffer.from(crypto.createHmac('sha256', CODE_SECRET).update(codeInput).digest('hex'), 'hex'),
+          Buffer.from(codeRecord.code_digest, 'hex')
+        );
 
-      // Mark verified
-      const users = loadUsers();
-      const user = users.find(u => u.email === email);
-      if (!user) {
-        return res.status(404).json({ success: false, error: 'User not found.' });
-      }
+        if (!isValid) {
+          db.prepare('UPDATE codes SET attempts = attempts + 1 WHERE id = ?').run(codeRecord.id);
+          throw new Error('Incorrect verification code.');
+        }
 
-      user.isVerified = true;
-      saveUsers(users);
+        const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
+        if (!user) {
+          throw new Error('User not found.');
+        }
 
-      // Remove used code
-      saveCodes(codes.filter(c => !(c.email === email && c.type === 'verify')));
+        const adminSetupEmail = normalizeEmail(process.env.ADMIN_SETUP_EMAIL || '');
+        const isFirstAdmin = adminSetupEmail !== '' && email === adminSetupEmail;
 
+        db.prepare(`
+          UPDATE users SET is_verified = 1, is_approved = CASE WHEN ? = 1 THEN 1 ELSE is_approved END, role = CASE WHEN ? = 1 THEN 'Administration' ELSE role END
+          WHERE email = ?
+        `).run(isFirstAdmin ? 1 : 0, isFirstAdmin ? 1 : 0, email);
+
+        db.prepare('DELETE FROM codes WHERE email = ? AND type = ?').run(email, 'verify');
+      });
+
+      verifyTx();
       res.json({ success: true, message: 'Email verified. You can now sign in.' });
     } catch (err: any) {
       console.error('Verify error:', err);
-      res.status(500).json({ success: false, error: err.toString() });
+      res.status(400).json({ success: false, error: err.message || err.toString() });
     }
   });
 
-  // Resend Code
+  // Resend Code (Requirement 2 & 3: 60s cooldown, invalidates previous codes)
   app.post('/api/auth/resend-code', async (req, res) => {
     try {
       const email = normalizeEmail(req.body.email);
@@ -482,27 +449,20 @@ async function startServer() {
         return res.status(429).json({ success: false, error: 'Please wait 60 seconds before requesting a new code.' });
       }
 
-      const users = loadUsers();
-      const user = users.find(u => u.email === email);
+      const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
       if (!user) {
-        // Return success to prevent email enumeration
         return res.json({ success: true, message: 'If the email exists, a new code has been sent.' });
       }
 
-      const code = String(Math.floor(100000 + Math.random() * 900000));
-      const codes = loadCodes().filter(c => !(c.email === email && c.type === type));
-      codes.push({
-        email,
-        code,
-        type,
-        expiresAt: Date.now() + 10 * 60 * 1000,
-        attempts: 0,
-        createdAt: Date.now()
-      });
-      saveCodes(codes);
+      const rawCode = String(crypto.randomInt(100000, 1000000));
+      const codeDigest = crypto.createHmac('sha256', CODE_SECRET).update(rawCode).digest('hex');
+
+      db.prepare('DELETE FROM codes WHERE email = ? AND type = ?').run(email, type);
+      db.prepare('INSERT INTO codes (email, code_digest, type, expires_at, attempts, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(email, codeDigest, type, Date.now() + 10 * 60 * 1000, 0, Date.now());
 
       const subject = type === 'reset' ? "Password Reset Code - D' Joy Plus" : "Verify your D' Joy Plus account";
-      await sendTransactionalEmail(email, subject, `Your new verification code is: ${code}\n\nThis code expires in 10 minutes.`);
+      await sendTransactionalEmail(email, subject, `Your new verification code is: ${rawCode}\n\nThis code expires in 10 minutes.`);
 
       res.json({ success: true, message: 'A new code has been sent to your email.' });
     } catch (err: any) {
@@ -511,7 +471,7 @@ async function startServer() {
     }
   });
 
-  // Login
+  // Login (Requirement 4: Secure HttpOnly Cookie & CSRF token)
   app.post('/api/auth/login', async (req, res) => {
     try {
       const email = normalizeEmail(req.body.email);
@@ -525,35 +485,41 @@ async function startServer() {
         return res.status(429).json({ success: false, error: 'Too many login attempts. Please try again later.' });
       }
 
-      const users = loadUsers();
-      const user = users.find(u => u.email === email);
+      const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
 
-      if (!user || !verifyPassword(password, user.passwordHash, user.salt)) {
+      if (!user || !verifyPassword(password, user.password_hash, user.salt)) {
         return res.status(401).json({ success: false, error: 'Invalid email or password.' });
       }
 
-      if (!user.isActive) {
+      if (!user.is_active) {
         return res.status(403).json({ success: false, error: 'This account has been disabled by Administration.' });
       }
 
-      if (!user.isVerified) {
+      if (!user.is_verified) {
         return res.status(403).json({ success: false, error: 'Email not verified. Please verify your email first.', unverified: true });
       }
 
-      if (!user.isApproved) {
+      if (!user.is_approved) {
         return res.status(403).json({ success: false, error: 'Waiting for administration approval.', pendingApproval: true });
       }
 
-      // Create session token
       const sessionId = crypto.randomBytes(32).toString('hex');
-      const sessions = loadSessions();
-      const expiresAt = Date.now() + 7 * 24 * 3600 * 1000; // 7 days
-      sessions.push({ sessionId, email, expiresAt });
-      saveSessions(sessions);
+      const csrfToken = crypto.randomBytes(32).toString('hex');
+      const expiresAt = Date.now() + 7 * 24 * 3600 * 1000;
+
+      db.prepare('INSERT INTO sessions (session_id, email, expires_at, csrf_token) VALUES (?, ?, ?, ?)')
+        .run(sessionId, email, expiresAt, csrfToken);
+
+      res.cookie('sessionId', sessionId, {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'lax',
+        maxAge: 7 * 24 * 3600 * 1000
+      });
 
       res.json({
         success: true,
-        token: sessionId,
+        csrfToken,
         user: {
           email: user.email,
           role: user.role
@@ -567,21 +533,26 @@ async function startServer() {
 
   // Logout
   app.post('/api/auth/logout', requireAuth, (req, res) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader?.replace('Bearer ', '') || req.headers['x-session-token'];
-    if (token) {
-      let sessions = loadSessions();
-      sessions = sessions.filter(s => s.sessionId !== token);
-      saveSessions(sessions);
+    const sessionId = req.cookies?.sessionId || req.headers['x-session-token'];
+    if (sessionId) {
+      db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId);
     }
+    res.clearCookie('sessionId');
     res.json({ success: true, message: 'Logged out successfully.' });
   });
 
-  // Get current user profile
+  // Get current user profile & CSRF token
   app.get('/api/auth/me', requireAuth, (req, res) => {
-    const user = (req as any).user as UserRecord;
+    const user = (req as any).user;
+    const sessionId = req.cookies?.sessionId;
+    let csrfToken = '';
+    if (sessionId) {
+      const session = db.prepare('SELECT csrf_token FROM sessions WHERE session_id = ?').get(sessionId) as any;
+      if (session) csrfToken = session.csrf_token;
+    }
     res.json({
       success: true,
+      csrfToken,
       user: {
         email: user.email,
         role: user.role,
@@ -592,7 +563,7 @@ async function startServer() {
     });
   });
 
-  // Forgot Password
+  // Forgot Password (Requirement 2: Generic response, no user enumeration)
   app.post('/api/auth/forgot-password', async (req, res) => {
     try {
       const email = normalizeEmail(req.body.email);
@@ -601,30 +572,23 @@ async function startServer() {
       }
 
       if (!checkRateLimit(`forgot:${email}`, 3, 300000)) {
-        return res.status(429).json({ success: false, error: 'Too requests. Please try again later.' });
+        return res.status(429).json({ success: false, error: 'Too many requests. Please try again later.' });
       }
 
-      const users = loadUsers();
-      const user = users.find(u => u.email === email);
+      const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
 
-      // Always show the same confirmation whether or not the account exists (prevent email enumeration)
-      if (user && user.isActive) {
-        const code = String(Math.floor(100000 + Math.random() * 900000));
-        const codes = loadCodes().filter(c => !(c.email === email && c.type === 'reset'));
-        codes.push({
-          email,
-          code,
-          type: 'reset',
-          expiresAt: Date.now() + 10 * 60 * 1000,
-          attempts: 0,
-          createdAt: Date.now()
-        });
-        saveCodes(codes);
+      if (user && user.is_active) {
+        const rawCode = String(crypto.randomInt(100000, 1000000));
+        const codeDigest = crypto.createHmac('sha256', CODE_SECRET).update(rawCode).digest('hex');
+
+        db.prepare('DELETE FROM codes WHERE email = ? AND type = ?').run(email, 'reset');
+        db.prepare('INSERT INTO codes (email, code_digest, type, expires_at, attempts, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(email, codeDigest, 'reset', Date.now() + 10 * 60 * 1000, 0, Date.now());
 
         await sendTransactionalEmail(
           email,
           "Password Reset Code - D' Joy Plus",
-          `Your password reset code is: ${code}\n\nThis code expires in 10 minutes.`
+          `Your password reset code is: ${rawCode}\n\nThis code expires in 10 minutes.`
         );
       }
 
@@ -635,15 +599,15 @@ async function startServer() {
     }
   });
 
-  // Reset Password
+  // Reset Password (Requirement 3: Revokes existing sessions, preserves role & approval status)
   app.post('/api/auth/reset-password', async (req, res) => {
     try {
       const email = normalizeEmail(req.body.email);
-      const code = (req.body.code || '').trim();
+      const codeInput = (req.body.code || '').trim();
       const newPassword = req.body.newPassword;
       const confirmPassword = req.body.confirmPassword;
 
-      if (!email || !code || !newPassword) {
+      if (!email || !codeInput || !newPassword) {
         return res.status(400).json({ success: false, error: 'All fields are required.' });
       }
 
@@ -655,122 +619,126 @@ async function startServer() {
         return res.status(400).json({ success: false, error: 'Password must be exactly 6 alphanumeric characters, including at least one letter and one number.' });
       }
 
-      const codes = loadCodes();
-      const codeRecord = codes.find(c => c.email === email && c.type === 'reset');
+      const resetTx = db.transaction(() => {
+        const codeRecord = db.prepare('SELECT * FROM codes WHERE email = ? AND type = ?').get(email, 'reset') as any;
 
-      if (!codeRecord || codeRecord.expiresAt < Date.now() || codeRecord.code !== code) {
-        return res.status(400).json({ success: false, error: 'Invalid or expired password reset code.' });
-      }
+        if (!codeRecord || codeRecord.expires_at < Date.now()) {
+          throw new Error('Invalid or expired password reset code.');
+        }
 
-      const users = loadUsers();
-      const user = users.find(u => u.email === email);
-      if (!user) {
-        return res.status(404).json({ success: false, error: 'User not found.' });
-      }
+        if (codeRecord.attempts >= 5) {
+          db.prepare('DELETE FROM codes WHERE id = ?').run(codeRecord.id);
+          throw new Error('Maximum attempts exceeded for this code. Please request a new one.');
+        }
 
-      const { passwordHash, salt } = hashPassword(newPassword);
-      user.passwordHash = passwordHash;
-      user.salt = salt;
-      saveUsers(users);
+        const isValid = crypto.timingSafeEqual(
+          Buffer.from(crypto.createHmac('sha256', CODE_SECRET).update(codeInput).digest('hex'), 'hex'),
+          Buffer.from(codeRecord.code_digest, 'hex')
+        );
 
-      // Invalidate reset code and existing sessions
-      saveCodes(codes.filter(c => !(c.email === email && c.type === 'reset')));
-      let sessions = loadSessions();
-      sessions = sessions.filter(s => s.email !== email);
-      saveSessions(sessions);
+        if (!isValid) {
+          db.prepare('UPDATE codes SET attempts = attempts + 1 WHERE id = ?').run(codeRecord.id);
+          throw new Error('Incorrect password reset code.');
+        }
 
+        const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as any;
+        if (!user) {
+          throw new Error('User not found.');
+        }
+
+        const { passwordHash, salt } = hashPassword(newPassword);
+        db.prepare('UPDATE users SET password_hash = ?, salt = ? WHERE email = ?').run(passwordHash, salt, email);
+
+        db.prepare('DELETE FROM codes WHERE email = ? AND type = ?').run(email, 'reset');
+        db.prepare('DELETE FROM sessions WHERE email = ?').run(email);
+      });
+
+      resetTx();
       res.json({ success: true, message: 'Password successfully reset. You can now sign in with your new password.' });
     } catch (err: any) {
       console.error('Reset password error:', err);
-      res.status(500).json({ success: false, error: err.toString() });
+      res.status(400).json({ success: false, error: err.message || err.toString() });
     }
   });
 
   // --- Admin API Routes ---
 
-  // Get all users (Admin only)
   app.get('/api/admin/users', requireAuth, requireAdmin, (req, res) => {
-    const users = loadUsers();
+    const users = db.prepare('SELECT email, role, is_verified, is_approved, is_active, created_at FROM users').all() as any[];
     res.json({
       success: true,
       users: users.map(u => ({
         email: u.email,
         role: u.role,
-        isVerified: u.isVerified,
-        isApproved: u.isApproved,
-        isActive: u.isActive,
-        createdAt: u.createdAt
+        isVerified: !!u.is_verified,
+        isApproved: !!u.is_approved,
+        isActive: !!u.is_active,
+        createdAt: u.created_at
       }))
     });
   });
 
-  // Approve or disable account (Admin only)
+  // Approve or disable account (Requirement 6: Prevent disabling/unapproving last active admin)
   app.post('/api/admin/users/:email/status', requireAuth, requireAdmin, (req, res) => {
     const targetEmail = normalizeEmail(req.params.email);
     const { isApproved, isActive } = req.body;
-    const currentUser = (req as any).user as UserRecord;
+    const currentUser = (req as any).user;
 
-    const users = loadUsers();
-    const targetUser = users.find(u => u.email === targetEmail);
+    const targetUser = db.prepare('SELECT * FROM users WHERE email = ?').get(targetEmail) as any;
     if (!targetUser) {
       return res.status(404).json({ success: false, error: 'User not found.' });
     }
 
-    if (targetEmail === currentUser.email && (isActive === false || isApproved === false)) {
-      return res.status(400).json({ success: false, error: 'You cannot disable or unapprove your own administrator account.' });
+    const newApproved = isApproved !== undefined ? (isApproved ? 1 : 0) : targetUser.is_approved;
+    const newActive = isActive !== undefined ? (isActive ? 1 : 0) : targetUser.is_active;
+
+    if (targetUser.role === 'Administration' && (newActive === 0 || newApproved === 0)) {
+      const activeAdmins = db.prepare("SELECT email FROM users WHERE role = 'Administration' AND is_active = 1 AND is_approved = 1").all() as any[];
+      if (activeAdmins.length <= 1 && activeAdmins.some(a => a.email === targetEmail)) {
+        return res.status(400).json({ success: false, error: 'Cannot disable or unapprove the last active administrator.' });
+      }
     }
 
-    if (isApproved !== undefined) targetUser.isApproved = !!isApproved;
-    if (isActive !== undefined) targetUser.isActive = !!isActive;
+    db.prepare('UPDATE users SET is_approved = ?, is_active = ? WHERE email = ?').run(newApproved, newActive, targetEmail);
 
-    saveUsers(users);
-
-    // Invalidate sessions if deactivated
-    if (!targetUser.isActive) {
-      let sessions = loadSessions();
-      sessions = sessions.filter(s => s.email !== targetEmail);
-      saveSessions(sessions);
+    if (newActive === 0) {
+      db.prepare('DELETE FROM sessions WHERE email = ?').run(targetEmail);
     }
 
     res.json({ success: true, message: 'User status updated successfully.' });
   });
 
-  // Change Role (Admin only)
+  // Change Role (Requirement 6: Prevent demoting last active admin)
   app.post('/api/admin/users/:email/role', requireAuth, requireAdmin, (req, res) => {
     const targetEmail = normalizeEmail(req.params.email);
     const newRole = req.body.role;
-    const currentUser = (req as any).user as UserRecord;
 
     if (!['Administration', 'Manager', 'Employee'].includes(newRole)) {
       return res.status(400).json({ success: false, error: 'Invalid role specified.' });
     }
 
-    const users = loadUsers();
-    const targetUser = users.find(u => u.email === targetEmail);
+    const targetUser = db.prepare('SELECT * FROM users WHERE email = ?').get(targetEmail) as any;
     if (!targetUser) {
       return res.status(404).json({ success: false, error: 'User not found.' });
     }
 
-    // Prevent demoting or removing the last active administrator
     if (targetUser.role === 'Administration' && newRole !== 'Administration') {
-      const activeAdmins = users.filter(u => u.role === 'Administration' && u.isActive && u.isApproved);
-      if (activeAdmins.length <= 1) {
+      const activeAdmins = db.prepare("SELECT email FROM users WHERE role = 'Administration' AND is_active = 1 AND is_approved = 1").all() as any[];
+      if (activeAdmins.length <= 1 && activeAdmins.some(a => a.email === targetEmail)) {
         return res.status(400).json({ success: false, error: 'Cannot demote the last active administrator.' });
       }
     }
 
-    targetUser.role = newRole;
-    saveUsers(users);
-
+    db.prepare('UPDATE users SET role = ? WHERE email = ?').run(newRole, targetEmail);
     res.json({ success: true, message: 'User role updated successfully.' });
   });
 
-  // --- Inquiries API Routes (Role-based filtering & Export restriction) ---
+  // --- Inquiries API Routes (Requirement 1: Employee restriction & Export restriction) ---
 
   app.get('/api/inquiries', requireAuth, async (req, res) => {
     try {
       const mode = req.query.mode === 'live' ? 'live' : 'demo';
-      const currentUser = (req as any).user as UserRecord;
+      const currentUser = (req as any).user;
 
       let rawData: InquiryRecord[] = [];
 
@@ -798,34 +766,29 @@ async function startServer() {
         if (result.status === 'success' && Array.isArray(result.data)) {
           rawData = result.data;
         } else {
-          throw new Error(result.message || 'Failed to retrieve live leads from Google Sheet.');
+          return res.status(502).json({ success: false, error: result.message || 'Failed to read data from Google Sheets.' });
         }
       }
 
-      // Filter based on role permissions:
-      // - Administration & Manager: see all rows
-      // - Employee: view only leads assigned to that employee (agentAssigned matches user name/email or unassigned/legacy)
+      // Requirement 1: Employees see only their assigned leads (exact match on agentAssigned normalized email)
       let filteredData = rawData;
       if (currentUser.role === 'Employee') {
-        const emailUser = currentUser.email.split('@')[0].toLowerCase();
-        filteredData = rawData.filter(item => {
-          const agent = (item.agentAssigned || '').toLowerCase();
-          return (
-            agent === 'unassigned' ||
-            agent.includes(emailUser) ||
-            agent.includes(currentUser.email.toLowerCase())
-          );
+        filteredData = rawData.filter(inq => {
+          const assigned = (inq.agentAssigned || '').trim().toLowerCase();
+          const empEmail = currentUser.email.toLowerCase();
+          const empUserPart = empEmail.split('@')[0];
+          return assigned === empEmail || assigned === empUserPart;
         });
       }
 
-      res.json({ success: true, mode, role: currentUser.role, data: filteredData });
+      res.json({ success: true, inquiries: filteredData });
     } catch (err: any) {
-      console.error('Inquiries get error:', err);
-      res.status(502).json({ success: false, error: err.toString() });
+      console.error('Fetch inquiries error:', err);
+      res.status(500).json({ success: false, error: err.toString() });
     }
   });
 
-  // Authorized Export Endpoint (Administration and Manager only - Employees forbidden)
+  // Export Inquiries (Requirement 1: Restricted to Manager or Administration)
   app.get('/api/inquiries/export', requireAuth, requireManagerOrAdmin, async (req, res) => {
     try {
       const mode = req.query.mode === 'live' ? 'live' : 'demo';
@@ -837,13 +800,12 @@ async function startServer() {
         const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL;
         const readSecret = process.env.APPS_SCRIPT_READ_SECRET;
         if (!appsScriptUrl || !readSecret) {
-          return res.status(503).json({ success: false, error: 'Live read not configured.' });
+          return res.status(503).json({ success: false, error: 'Live read access not configured.' });
         }
-        const envelope = { operation: 'read', credential: readSecret };
         const response = await fetch(appsScriptUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(envelope)
+          body: JSON.stringify({ operation: 'read', credential: readSecret })
         });
         const result = await response.json();
         if (result.status === 'success' && Array.isArray(result.data)) {
@@ -851,313 +813,113 @@ async function startServer() {
         }
       }
 
-      const csvRows = [
-        ['Date', 'Timestamp', 'Inquiry_ID', 'Customer_Name', 'Phone_Number', 'Source_Campaign', 'Message_Summary', 'Agent_Assigned', 'Status'],
-        ...rawData.map(i => [i.date, i.timestamp, i.inquiryId, i.customerName, i.phoneNumber, i.sourceCampaign, i.messageSummary, i.agentAssigned, i.status])
-      ];
-
-      const csvContent = csvRows.map(e => e.map(field => `"${String(field || '').replace(/"/g, '""')}"`).join(',')).join('\n');
+      const headers = ['Date', 'Timestamp', 'Inquiry ID', 'Customer Name', 'Phone Number', 'Campaign', 'Message Summary', 'Agent Assigned', 'Status'];
+      const csvRows = [headers.join(',')];
+      for (const inq of rawData) {
+        const row = [
+          inq.date,
+          `"${inq.timestamp}"`,
+          inq.inquiryId,
+          `"${(inq.customerName || '').replace(/"/g, '""')}"`,
+          `"${inq.phoneNumber}"`,
+          `"${inq.sourceCampaign}"`,
+          `"${(inq.messageSummary || '').replace(/"/g, '""')}"`,
+          `"${inq.agentAssigned}"`,
+          inq.status
+        ];
+        csvRows.push(row.join(','));
+      }
 
       res.setHeader('Content-Type', 'text/csv');
-      res.setHeader('Content-Disposition', `attachment; filename=Inquiries_Export_${mode}.csv`);
-      res.send(csvContent);
+      res.setHeader('Content-Disposition', 'attachment; filename=djoyplus_inquiries_export.csv');
+      res.send(csvRows.join('\n'));
     } catch (err: any) {
-      console.error('Export error:', err);
+      res.status(500).send('Export error: ' + err.toString());
+    }
+  });
+
+  // --- CRM Webhook Ingestion (Independent of staff sessions) ---
+  app.post('/api/webhook/whatsapp', verifyWebhookSecret, async (req, res) => {
+    try {
+      const body = req.body;
+      const { date, timestamp, inquiryId, customerName, phoneNumber, sourceCampaign, messageSummary, agentAssigned, status } = body;
+
+      if (!inquiryId || !customerName || !phoneNumber) {
+        return res.status(400).json({ status: 'error', code: 'INVALID_PAYLOAD', message: 'Missing required inquiry fields.' });
+      }
+
+      const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL;
+      const writeSecret = process.env.APPS_SCRIPT_WRITE_SECRET;
+
+      if (!appsScriptUrl || !writeSecret || writeSecret.trim() === '') {
+        return res.status(503).json({ status: 'error', code: 'CONFIG_ERROR', message: 'Apps Script write-only endpoint not configured.' });
+      }
+
+      const newInquiry: InquiryRecord = {
+        date: date || new Date().toISOString().split('T')[0],
+        timestamp: timestamp || new Date().toISOString().replace('T', ' ').substring(0, 19),
+        inquiryId,
+        customerName,
+        phoneNumber,
+        sourceCampaign: sourceCampaign || 'Direct_WhatsApp',
+        messageSummary: messageSummary || '',
+        agentAssigned: agentAssigned || 'Unassigned',
+        status: status || 'New'
+      };
+
+      const envelope = { operation: 'write', credential: writeSecret, payload: newInquiry };
+      const response = await fetch(appsScriptUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(envelope)
+      });
+
+      if (!response.ok) {
+        return res.status(503).json({ status: 'error', code: 'APPS_SCRIPT_UNAVAILABLE', message: `Apps Script unreachable (HTTP ${response.status})` });
+      }
+
+      const result = await response.json();
+      if (result.status === 'success') {
+        return res.json({ status: 'success', message: 'Inquiry successfully saved to Google Sheets.' });
+      } else {
+        return res.status(503).json({ status: 'error', code: 'SHEETS_WRITE_FAILED', message: result.message || 'Google Sheets rejected the write.' });
+      }
+    } catch (err: any) {
+      console.error('Webhook error:', err);
+      res.status(500).json({ status: 'error', code: 'INTERNAL_ERROR', message: err.toString() });
+    }
+  });
+
+  // --- Gemini Mapper Proxy (Rate-limited, API key protected on server) ---
+  app.post('/api/gemini/map', requireAuth, geminiRateLimiter, async (req, res) => {
+    try {
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        return res.status(500).json({ success: false, error: 'Gemini API key not configured on server.' });
+      }
+
+      const payload = req.body.payload;
+      const ai = new GoogleGenAI({ apiKey });
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: `Map the following WhatsApp inquiry JSON payload into standard CRM format { inquiryId, customerName, phoneNumber, sourceCampaign, messageSummary, agentAssigned, status }:\n${JSON.stringify(payload)}`
+      });
+
+      res.json({ success: true, result: response.text });
+    } catch (err: any) {
       res.status(500).json({ success: false, error: err.toString() });
     }
   });
 
-  // Reset demo data
-  app.post('/api/inquiries/reset', requireAuth, requireManagerOrAdmin, (req, res) => {
-    demoInquiries = [
-      {
-        date: new Date().toISOString().split('T')[0],
-        timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
-        inquiryId: 'WH-88392',
-        customerName: 'Sarah Jenkins',
-        phoneNumber: '+15552348901',
-        sourceCampaign: 'Meta_FB_Promo_Nov',
-        messageSummary: 'Inquired about pricing and availability for the enterprise tier.',
-        agentAssigned: 'Alex Tan',
-        status: 'Qualified'
-      },
-      {
-        date: new Date().toISOString().split('T')[0],
-        timestamp: new Date(Date.now() - 3600000 * 2).toISOString().replace('T', ' ').substring(0, 19),
-        inquiryId: 'WH-88391',
-        customerName: 'Marcus Vance',
-        phoneNumber: '+15559876543',
-        sourceCampaign: 'Google_Search_Brand',
-        messageSummary: 'Asked for onboarding documentation and setup guide.',
-        agentAssigned: 'Jessica Lee',
-        status: 'Closed'
-      }
-    ];
-    res.json({ success: true, data: demoInquiries });
+  const vite = await createViteServer({
+    server: { middlewareMode: true },
+    appType: 'spa'
   });
+  app.use(vite.middlewares);
 
-  // Live WhatsApp Webhook Endpoint (CRM write access, verified via X-Webhook-Secret header)
-  app.post('/api/webhook/whatsapp', verifyWebhookSecret, async (req, res) => {
-    try {
-      const payload = req.body;
-      const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL;
-      const writeSecret = process.env.APPS_SCRIPT_WRITE_SECRET;
-
-      if (!appsScriptUrl || !writeSecret || writeSecret.trim() === '') {
-        return res.status(503).json({ status: 'error', code: 'CONFIG_ERROR', message: 'Apps Script write access not configured on server.' });
-      }
-
-      const envelope = {
-        operation: 'write',
-        credential: writeSecret,
-        payload
-      };
-
-      const gsResponse = await fetch(appsScriptUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(envelope)
-      });
-
-      if (!gsResponse.ok) {
-        return res.status(502).json({ status: 'error', code: 'STORAGE_HTTP_ERROR', message: `Google Sheets storage HTTP error (${gsResponse.status})` });
-      }
-
-      const gsResult = await gsResponse.json();
-
-      if (gsResult.status === 'error' && gsResult.code === 'UNAUTHORIZED') {
-        return res.status(503).json({ status: 'error', code: 'BACKEND_CONFIG_ERROR', message: 'Backend configuration error: Internal Apps Script write credential rejected.' });
-      }
-
-      if (gsResult.status === 'busy' || gsResult.code === 'BUSY') {
-        return res.status(503).json({ status: 'busy', code: 'BUSY', message: gsResult.message || 'Google Sheets is busy (lock contention).' });
-      }
-
-      if (gsResult.status === 'error') {
-        const code = gsResult.code || 'STORAGE_ERROR';
-        if (code === 'INVALID_INPUT' || code === 'INVALID_STATUS') {
-          return res.status(400).json({ status: 'error', code, message: gsResult.message || 'Invalid input or unsupported status.' });
-        }
-        return res.status(503).json({ status: 'error', code, message: gsResult.message || 'Temporary storage error.' });
-      }
-
-      if (gsResult.status === 'success' || gsResult.status === 'updated') {
-        return res.json({
-          status: gsResult.status,
-          action: gsResult.action || gsResult.status,
-          message: 'Lead successfully saved in Google Sheets source of truth.'
-        });
-      }
-
-      return res.status(502).json({ status: 'error', code: 'UNKNOWN_RESPONSE', message: 'Unexpected response from Google Sheets receiver.' });
-    } catch (err: any) {
-      console.error('Live webhook forwarding error:', err);
-      return res.status(503).json({ status: 'error', code: 'RETRYABLE_ERROR', message: `Temporary storage unavailable: ${err.toString()}` });
-    }
-  });
-
-  // Manually invoked migration endpoint (Administration only)
-  app.post('/api/admin/migrate-legacy', requireAuth, requireAdmin, async (req, res) => {
-    try {
-      const { dryRun = true } = req.body || {};
-      if (!fs.existsSync(LEGACY_JSON_FILE)) {
-        return res.json({ success: true, message: 'No legacy json file found at data/live_inquiries.json.', stats: { wouldImport: 0, imported: 0, skipped: 0, conflicted: 0, failed: 0 } });
-      }
-
-      const content = fs.readFileSync(LEGACY_JSON_FILE, 'utf-8');
-      const legacyRecords: InquiryRecord[] = JSON.parse(content);
-
-      if (!Array.isArray(legacyRecords) || legacyRecords.length === 0) {
-        return res.json({ success: true, message: 'Legacy file is empty.', stats: { wouldImport: 0, imported: 0, skipped: 0, conflicted: 0, failed: 0 } });
-      }
-
-      const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL;
-      const writeSecret = process.env.APPS_SCRIPT_WRITE_SECRET;
-
-      if (!appsScriptUrl || !writeSecret || writeSecret.trim() === '') {
-        return res.status(503).json({ success: false, error: 'Migration requires APPS_SCRIPT_WEB_APP_URL and APPS_SCRIPT_WRITE_SECRET configured.' });
-      }
-
-      const envelope = {
-        operation: 'migrate',
-        credential: writeSecret,
-        payload: {
-          records: legacyRecords,
-          dryRun: !!dryRun
-        }
-      };
-
-      const gsResponse = await fetch(appsScriptUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(envelope)
-      });
-
-      if (!gsResponse.ok) {
-        return res.status(502).json({ success: false, error: `Migration storage HTTP error (${gsResponse.status})` });
-      }
-
-      const gsResult = await gsResponse.json();
-      if (gsResult.status === 'success') {
-        return res.json({
-          success: true,
-          dryRun: !!dryRun,
-          message: dryRun ? 'Migration dry run completed successfully. Zero writes performed.' : 'Live migration completed successfully. Original file left intact.',
-          stats: gsResult.stats
-        });
-      } else {
-        return res.status(503).json({ success: false, error: gsResult.message || 'Migration failed in Apps Script.' });
-      }
-    } catch (err: any) {
-      console.error('Migration error:', err);
-      return res.status(500).json({ success: false, error: err.toString() });
-    }
-  });
-
-  // Authenticated Simulator Endpoint (Manager or Admin)
-  app.post('/api/simulator/send', requireAuth, requireManagerOrAdmin, (req, res) => {
-    try {
-      const payload = req.body;
-      const { dateStr, timestampStr } = getMalaysiaDateTime();
-
-      const inquiryId = payload.id || payload.message_id || `WH-${Math.floor(10000 + Math.random() * 90000)}`;
-      const customerName = String(
-        payload.contact?.name || 
-        payload.name || 
-        payload.contact?.full_name || 
-        payload.customer?.full_name || 
-        'Unknown'
-      );
-      
-      const rawPhone = String(
-        payload.contact?.phone || 
-        payload.phone || 
-        payload.sender?.phone || 
-        payload.customer?.phone || 
-        ''
-      );
-      const phoneNumber = rawPhone.replace(/[^0-9+]/g, '');
-
-      if (!phoneNumber) {
-        return res.status(400).json({ status: 'error', code: 'INVALID_INPUT', message: 'Validation error: Missing required phone number.' });
-      }
-
-      const sourceCampaign = String(payload.source || payload.utm_campaign || payload.campaign_name || 'Organic / Direct');
-      
-      const hasMessage = payload.text !== undefined || payload.message !== undefined || payload.body !== undefined || payload.content !== undefined;
-      const messageSummary = hasMessage ? String(payload.text || payload.message || payload.body || payload.content || '') : null;
-
-      const hasAgent = payload.assignee !== undefined || payload.agent?.name !== undefined;
-      const agentAssigned = hasAgent ? String(payload.assignee || payload.agent?.name || 'Unassigned') : null;
-
-      let status = payload.status !== undefined ? String(payload.status) : null;
-      const supportedStatuses = ['New', 'In Progress', 'Qualified', 'Closed', 'Lost'];
-      if (status !== null) {
-        if (!supportedStatuses.includes(status)) {
-          return res.status(400).json({ status: 'error', code: 'INVALID_STATUS', message: 'Unsupported status value.' });
-        }
-      }
-
-      const existingIndex = demoInquiries.findIndex(
-        item => item.date === dateStr && item.phoneNumber === phoneNumber
-      );
-
-      if (existingIndex >= 0) {
-        const existing = demoInquiries[existingIndex];
-        demoInquiries[existingIndex] = {
-          ...existing,
-          timestamp: timestampStr,
-          messageSummary: messageSummary !== null ? messageSummary : existing.messageSummary,
-          agentAssigned: agentAssigned !== null ? agentAssigned : existing.agentAssigned,
-          status: status !== null ? (status as InquiryRecord['status']) : existing.status
-        };
-        return res.json({
-          status: 'updated',
-          row: existingIndex + 2,
-          mode: 'demo',
-          message: 'Existing demo inquiry updated for today (deduplicated).'
-        });
-      }
-
-      const newRecord: InquiryRecord = {
-        date: dateStr,
-        timestamp: timestampStr,
-        inquiryId,
-        customerName,
-        phoneNumber,
-        sourceCampaign,
-        messageSummary: messageSummary !== null ? messageSummary : '',
-        agentAssigned: agentAssigned !== null ? agentAssigned : 'Unassigned',
-        status: status !== null ? (status as InquiryRecord['status']) : 'New'
-      };
-
-      demoInquiries.unshift(newRecord);
-
-      return res.json({
-        status: 'success',
-        action: 'appended',
-        mode: 'demo',
-        record: newRecord
-      });
-    } catch (err: any) {
-      console.error('Simulator webhook error:', err);
-      return res.status(500).json({ status: 'error', code: 'SERVER_ERROR', message: err.toString() });
-    }
-  });
-
-  // AI payload analysis endpoint (Protected by requireAuth & manager/admin)
-  app.post('/api/ai/analyze-payload', requireAuth, requireManagerOrAdmin, geminiRateLimiter, async (req, res) => {
-    try {
-      const { platformName, jsonPayload } = req.body;
-      const apiKey = process.env.GEMINI_API_KEY;
-
-      if (!apiKey) {
-        return res.status(500).json({ success: false, error: 'GEMINI_API_KEY not configured in environment.' });
-      }
-
-      const sanitizedPayload = sanitizeJsonForAi(jsonPayload);
-
-      const ai = new GoogleGenAI({ apiKey });
-      const prompt = `You are a Google Apps Script & webhook integration expert.
-A user wants to integrate a 3rd party WhatsApp platform named "${platformName}" with Google Sheets.
-Here is the sanitized sample JSON webhook payload structure:
-${JSON.stringify(sanitizedPayload, null, 2)}
-
-Provide a concise, expert analysis with:
-1. Exact JavaScript snippet to extract customerName, phoneNumber, sourceCampaign, messageSummary, agentAssigned, and status from this specific JSON structure in Google Apps Script (doPost).
-2. Key fields mapped.
-3. Potential gotchas (e.g. nested contact objects, phone formatting).`;
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt
-      });
-
-      res.json({ success: true, analysis: response.text });
-    } catch (err: any) {
-      console.error('AI Analysis error:', err);
-      const safeMessage = err.toString().replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_API_KEY]');
-      res.status(500).json({ success: false, error: safeMessage });
-    }
-  });
-
-  // Production vs. Development middleware setup
-  if (process.env.NODE_ENV === 'production') {
-    const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  } else {
-    const vite = await createViteServer({
-      server: { middlewareMode: true, hmr: process.env.DISABLE_HMR !== 'true' }
-    });
-    app.use(vite.middlewares);
-  }
-
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`);
+  const PORT = 3000;
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on http://localhost:${PORT}`);
   });
 }
 

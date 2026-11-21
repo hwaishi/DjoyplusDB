@@ -109,8 +109,8 @@ const PRESET_PAYLOADS = {
 
 export default function App() {
   // Auth state
-  const [sessionToken, setSessionToken] = useState<string>(localStorage.getItem('dj_session_token') || '');
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
+  const [csrfToken, setCsrfToken] = useState<string>('');
   const [authView, setAuthView] = useState<'login' | 'signup' | 'verify' | 'forgot' | 'reset' | 'pending_approval'>('login');
   const [authEmailInput, setAuthEmailInput] = useState('');
   const [authPasswordInput, setAuthPasswordInput] = useState('');
@@ -160,17 +160,15 @@ export default function App() {
 
   // Check session on mount
   useEffect(() => {
-    if (sessionToken) {
-      fetchCurrentUser();
-    }
-  }, [sessionToken]);
+    fetchCurrentUser();
+  }, []);
 
-  // Fetch inquiries when sessionToken or dataMode changes
+  // Fetch inquiries when currentUser or dataMode changes
   useEffect(() => {
-    if (sessionToken && currentUser?.isVerified && currentUser?.isApproved) {
+    if (currentUser?.isVerified && currentUser?.isApproved) {
       fetchInquiries();
     }
-  }, [sessionToken, dataMode, currentUser]);
+  }, [currentUser, dataMode]);
 
   // Resend countdown timer
   useEffect(() => {
@@ -183,21 +181,22 @@ export default function App() {
   const fetchCurrentUser = async () => {
     try {
       const res = await fetch('/api/auth/me', {
-        headers: { 'Authorization': `Bearer ${sessionToken}` }
+        credentials: 'include'
       });
       const data = await res.json();
       if (data.success) {
         setCurrentUser(data.user);
+        if (data.csrfToken) setCsrfToken(data.csrfToken);
         if (!data.user.isVerified) {
           setAuthView('verify');
         } else if (!data.user.isApproved) {
           setAuthView('pending_approval');
         }
       } else {
-        handleLogout();
+        setCurrentUser(null);
       }
     } catch (err) {
-      handleLogout();
+      setCurrentUser(null);
     }
   };
 
@@ -205,12 +204,12 @@ export default function App() {
     try {
       await fetch('/api/auth/logout', {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${sessionToken}` }
+        credentials: 'include',
+        headers: { 'X-CSRF-Token': csrfToken }
       });
     } catch (e) {}
-    setSessionToken('');
     setCurrentUser(null);
-    localStorage.removeItem('dj_session_token');
+    setCsrfToken('');
     setAuthView('login');
   };
 
@@ -219,11 +218,11 @@ export default function App() {
       setLoading(true);
       setErrorMsg(null);
       const res = await fetch(`/api/inquiries?mode=${dataMode}`, {
-        headers: { 'Authorization': `Bearer ${sessionToken}` }
+        credentials: 'include'
       });
       const data = await res.json();
       if (data.success) {
-        setInquiries(data.data || []);
+        setInquiries(data.inquiries || data.data || []);
       } else {
         setErrorMsg(data.error || 'Failed to load inquiries.');
         setInquiries([]);
@@ -244,17 +243,19 @@ export default function App() {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ email: authEmailInput, password: authPasswordInput })
       });
       const data = await res.json();
       if (data.success) {
-        setSessionToken(data.token);
-        localStorage.setItem('dj_session_token', data.token);
         setCurrentUser(data.user);
+        if (data.csrfToken) setCsrfToken(data.csrfToken);
         if (!data.user.isVerified) {
           setAuthView('verify');
         } else if (!data.user.isApproved) {
           setAuthView('pending_approval');
+        } else {
+          fetchInquiries();
         }
       } else {
         if (data.unverified) {
@@ -391,7 +392,7 @@ export default function App() {
   const fetchAdminUsers = async () => {
     try {
       const res = await fetch('/api/admin/users', {
-        headers: { 'Authorization': `Bearer ${sessionToken}` }
+        credentials: 'include'
       });
       const data = await res.json();
       if (data.success) {
@@ -412,8 +413,9 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${sessionToken}`
+          'X-CSRF-Token': csrfToken
         },
+        credentials: 'include',
         body: JSON.stringify({ isApproved, isActive })
       });
       const data = await res.json();
@@ -433,8 +435,9 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${sessionToken}`
+          'X-CSRF-Token': csrfToken
         },
+        credentials: 'include',
         body: JSON.stringify({ role: newRole })
       });
       const data = await res.json();
@@ -456,7 +459,8 @@ export default function App() {
     try {
       const res = await fetch('/api/inquiries/reset', {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${sessionToken}` }
+        headers: { 'X-CSRF-Token': csrfToken },
+        credentials: 'include'
       });
       const data = await res.json();
       if (data.success) {
@@ -477,8 +481,9 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${sessionToken}`
+          'X-CSRF-Token': csrfToken
         },
+        credentials: 'include',
         body: JSON.stringify({ dryRun })
       });
       const data = await res.json();
@@ -503,8 +508,9 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${sessionToken}`
+          'X-CSRF-Token': csrfToken
         },
+        credentials: 'include',
         body: JSON.stringify(parsedPayload)
       });
       const data = await res.json();
@@ -529,17 +535,18 @@ export default function App() {
       setIsAnalyzing(true);
       setAiAnalysisResult('');
       const parsed = JSON.parse(aiSamplePayload);
-      const res = await fetch('/api/ai/analyze-payload', {
+      const res = await fetch('/api/gemini/map', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${sessionToken}`
+          'X-CSRF-Token': csrfToken
         },
+        credentials: 'include',
         body: JSON.stringify({ platformName: aiPlatformName, jsonPayload: parsed })
       });
       const data = await res.json();
       if (data.success) {
-        setAiAnalysisResult(data.analysis);
+        setAiAnalysisResult(data.result || data.analysis);
       } else {
         setAiAnalysisResult('Error: ' + (data.error || 'Unknown error'));
       }
@@ -903,7 +910,7 @@ function createJsonResponse(obj) {
 }`;
 
   // If not signed in or not verified/approved, render Auth Views
-  if (!sessionToken || !currentUser || !currentUser.isVerified || !currentUser.isApproved) {
+  if (!currentUser || !currentUser.isVerified || !currentUser.isApproved) {
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-4 font-sans">
         <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-xl space-y-6">
