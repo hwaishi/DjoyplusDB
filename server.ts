@@ -189,6 +189,7 @@ function getEmailTransporter() {
     host,
     port,
     secure: port === 465,
+    requireTLS: port === 587,
     auth: { user, pass }
   });
 }
@@ -725,6 +726,46 @@ async function startServer() {
 
     db.prepare('UPDATE users SET role = ? WHERE email = ?').run(newRole, targetEmail);
     res.json({ success: true, message: 'User role updated successfully.' });
+  });
+
+  // SMTP Connection & Authentication Test Route
+  app.get('/api/admin/smtp-test', requireAuth, requireAdmin, async (req, res) => {
+    const host = process.env.SMTP_HOST;
+    const port = process.env.SMTP_PORT;
+    const user = process.env.SMTP_USER;
+    const pass = process.env.SMTP_PASS;
+    const from = process.env.SMTP_FROM;
+
+    const missing = [];
+    if (!host) missing.push('SMTP_HOST');
+    if (!port) missing.push('SMTP_PORT');
+    if (!user) missing.push('SMTP_USER');
+    if (!pass) missing.push('SMTP_PASS');
+    if (!from) missing.push('SMTP_FROM');
+
+    if (missing.length > 0) {
+      return res.json({
+        success: false,
+        status: 'missing_settings',
+        missingVariables: missing,
+        error: `Missing required environment variables: ${missing.join(', ')}`
+      });
+    }
+
+    try {
+      const transporter = getEmailTransporter();
+      if (!transporter) {
+        return res.json({ success: false, status: 'config_error', error: 'Email transporter could not be initialized.' });
+      }
+      await transporter.verify();
+      res.json({ success: true, status: 'connected', message: 'SMTP connection and authentication verified successfully.' });
+    } catch (err: any) {
+      if (err.code === 'EAUTH' || err.responseCode === 535) {
+        res.json({ success: false, status: 'auth_rejected', error: 'SMTP Authentication rejected. Please verify your Gmail App Password.' });
+      } else {
+        res.json({ success: false, status: 'connection_failed', error: 'SMTP Connection failed: ' + err.message });
+      }
+    }
   });
 
   // --- Inquiries API Routes ---
