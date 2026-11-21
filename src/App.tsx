@@ -17,21 +17,18 @@ import {
   RefreshCw,
   Download,
   ExternalLink,
-  PlusCircle,
-  CheckCircle2,
-  AlertCircle,
+  Shield,
+  Key,
+  Lock,
+  Database,
   Filter,
   Search,
   Users,
-  PhoneCall,
   MessageSquare,
-  Settings,
   Code,
   Layers,
-  Send,
   Zap,
   HelpCircle,
-  Database,
   ArrowUpRight
 } from 'lucide-react';
 
@@ -62,9 +59,9 @@ const PRESET_PAYLOADS = {
   wati: {
     message_id: "WATI-" + Math.floor(10000 + Math.random() * 90000),
     name: "David Kim",
-    phone: "+6591234567",
+    phone: "+60123456789",
     utm_campaign: "Wati_Broadcast_Promo",
-    message: "Do you have enterprise billing options available?",
+    message: "=SUM(1,1) Enterprise billing inquiry.",
     agent: { name: "Jessica Lee" },
     status: "In Progress"
   },
@@ -94,8 +91,13 @@ const PRESET_PAYLOADS = {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'simulator' | 'webhook' | 'gas' | 'ai' | 'blueprint'>('dashboard');
+  const [dataMode, setDataMode] = useState<'demo' | 'live'>('demo');
+  const [staffToken, setStaffToken] = useState<string>(localStorage.getItem('sheetflow_staff_token') || 'my_secure_staff_token');
+  const [authStatus, setAuthStatus] = useState<{ staffKeySet: boolean; webhookSecretSet: boolean; geminiKeySet: boolean } | null>(null);
+
   const [inquiries, setInquiries] = useState<InquiryRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [sheetTab, setSheetTab] = useState<'raw' | 'summary'>('raw');
   
   // Webhook Tester State
@@ -105,13 +107,14 @@ export default function App() {
   const [isSendingWebhook, setIsSendingWebhook] = useState(false);
 
   // GAS Generator Config State
+  const [gasSpreadsheetId, setGasSpreadsheetId] = useState('YOUR_SPREADSHEET_ID_HERE');
   const [gasSheetName, setGasSheetName] = useState('Raw_Inquiries');
   const [gasDeduplicate, setGasDeduplicate] = useState(true);
   const [copiedCode, setCopiedCode] = useState(false);
 
   // AI Assistant State
   const [aiPlatformName, setAiPlatformName] = useState('Custom WhatsApp CRM');
-  const [aiSamplePayload, setAiSamplePayload] = useState('{\n  "event": "message.received",\n  "data": {\n    "sender_name": "John Doe",\n    "wa_id": "15551234567",\n    "message_body": "Hello"\n  }\n}');
+  const [aiSamplePayload, setAiSamplePayload] = useState('{\n  "event": "message.received",\n  "contact": {\n    "full_name": "Jane Doe",\n    "phone": "+60129876543"\n  },\n  "message_body": "Hello world"\n}');
   const [aiAnalysisResult, setAiAnalysisResult] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
 
@@ -119,47 +122,91 @@ export default function App() {
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('All');
 
-  // Fetch inquiries on mount
+  // Check server auth status on mount
+  useEffect(() => {
+    fetchAuthStatus();
+  }, []);
+
+  // Fetch inquiries whenever mode or token changes
   useEffect(() => {
     fetchInquiries();
-  }, []);
+  }, [dataMode, staffToken]);
+
+  const fetchAuthStatus = async () => {
+    try {
+      const res = await fetch('/api/auth/status');
+      const data = await res.json();
+      if (data.success) {
+        setAuthStatus(data.config);
+      }
+    } catch (err) {
+      console.error('Failed to fetch auth status:', err);
+    }
+  };
 
   const fetchInquiries = async () => {
     try {
       setLoading(true);
-      const res = await fetch('/api/inquiries');
+      setErrorMsg(null);
+      const res = await fetch(`/api/inquiries?mode=${dataMode}`, {
+        headers: {
+          'x-staff-token': staffToken
+        }
+      });
       const data = await res.json();
       if (data.success) {
         setInquiries(data.data);
+      } else {
+        setErrorMsg(data.error || 'Failed to authenticate or fetch inquiries.');
+        setInquiries([]);
       }
-    } catch (err) {
-      console.error('Failed to fetch inquiries:', err);
+    } catch (err: any) {
+      setErrorMsg(err.toString());
     } finally {
       setLoading(false);
     }
   };
 
+  const handleSaveToken = (token: string) => {
+    setStaffToken(token);
+    localStorage.setItem('sheetflow_staff_token', token);
+  };
+
   const handleResetData = async () => {
+    if (dataMode === 'live') {
+      alert('Reset is restricted to Demo Sandbox records only. Live records are durable.');
+      return;
+    }
     try {
-      const res = await fetch('/api/inquiries/reset', { method: 'POST' });
+      const res = await fetch('/api/inquiries/reset', {
+        method: 'POST',
+        headers: {
+          'x-staff-token': staffToken
+        }
+      });
       const data = await res.json();
       if (data.success) {
         setInquiries(data.data);
+      } else {
+        alert(data.error || 'Reset failed.');
       }
-    } catch (err) {
-      console.error('Failed to reset inquiries:', err);
+    } catch (err: any) {
+      alert('Reset failed: ' + err.toString());
     }
   };
 
-  const handleSendWebhook = async () => {
+  const handleSendSimulatorWebhook = async () => {
     try {
       setIsSendingWebhook(true);
       setWebhookResponse(null);
       const parsedPayload = JSON.parse(customPayloadJson);
       
-      const res = await fetch('/api/webhook/whatsapp', {
+      const res = await fetch('/api/simulator/send', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-staff-token': staffToken
+        },
         body: JSON.stringify(parsedPayload)
       });
       const data = await res.json();
@@ -184,7 +231,10 @@ export default function App() {
       const parsed = JSON.parse(aiSamplePayload);
       const res = await fetch('/api/ai/analyze-payload', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-staff-token': staffToken
+        },
         body: JSON.stringify({ platformName: aiPlatformName, jsonPayload: parsed })
       });
       const data = await res.json();
@@ -234,18 +284,31 @@ export default function App() {
   const generatedGasCode = `/**
  * Google Apps Script Webhook Receiver for WhatsApp Inquiries
  * Generated by WhatsApp Sheets Automation Hub
- * Deploy as Web App -> Execute as: Me | Who has access: Anyone
+ * Secure production version with Webhook Secret Authentication & Spreadsheet ID
  */
 
+const SPREADSHEET_ID = "${gasSpreadsheetId}";
 const SHEET_NAME = "${gasSheetName}";
 const DEDUPLICATE_SAME_DAY = ${gasDeduplicate};
 
 function doPost(e) {
+  // 1. Webhook Authentication Check
+  const expectedSecret = PropertiesService.getScriptProperties().getProperty("WHATSAPP_WEBHOOK_SECRET");
+  const providedSecret = (e && e.parameter && e.parameter.secret) || 
+                         (e && e.parameter && e.parameter.token) || 
+                         (e && e.headers && (e.headers["X-Webhook-Secret"] || e.headers["x-webhook-secret"]));
+  
+  if (!expectedSecret || providedSecret !== expectedSecret) {
+    return createJsonResponse({ status: "error", message: "Unauthorized: Invalid or missing webhook secret." });
+  }
+
   const lock = LockService.getScriptLock();
-  lock.tryLock(10000);
+  if (!lock.tryLock(10000)) {
+    return createJsonResponse({ status: "busy", message: "Server busy. Try again later." });
+  }
 
   try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
     const sheet = ss.getSheetByName(SHEET_NAME);
     
     if (!sheet) {
@@ -256,25 +319,45 @@ function doPost(e) {
     const payload = JSON.parse(rawData);
 
     const now = new Date();
-    const timezone = ss.getSpreadsheetTimeZone();
+    const timezone = "Asia/Kuala_Lumpur";
     const dateStr = Utilities.formatDate(now, timezone, "yyyy-MM-dd");
     const timestampStr = Utilities.formatDate(now, timezone, "yyyy-MM-dd HH:mm:ss");
 
     const inquiryId = payload.id || payload.message_id || Utilities.getUuid();
-    const customerName = payload.contact?.name || payload.name || payload.customer?.full_name || "Unknown";
-    const phoneNumber = String(payload.contact?.phone || payload.phone || payload.sender?.phone || "").replace(/[^0-9+]/g, "");
-    const sourceCampaign = payload.source || payload.utm_campaign || payload.campaign_name || "Organic / Direct";
-    const messageSummary = payload.text || payload.message || payload.body || payload.content || "";
-    const agentAssigned = payload.assignee || payload.agent?.name || "Unassigned";
-    const status = payload.status || "New";
+    const customerName = String(payload.contact?.name || payload.name || payload.contact?.full_name || payload.customer?.full_name || "Unknown");
+    const rawPhone = String(payload.contact?.phone || payload.phone || payload.sender?.phone || payload.customer?.phone || "");
+    const phoneNumber = rawPhone.replace(/[^0-9+]/g, "");
+    
+    if (!phoneNumber) {
+      return createJsonResponse({ status: "error", message: "Validation error: Missing required phone number." });
+    }
+
+    const sourceCampaign = String(payload.source || payload.utm_campaign || payload.campaign_name || "Organic / Direct");
+    const messageSummary = String(payload.text || payload.message || payload.body || payload.content || "");
+    const agentAssigned = String(payload.assignee || payload.agent?.name || "Unassigned");
+    const status = String(payload.status || "New");
+
+    // Text safety wrapper to prevent formula injection (=) and preserve leading zeros / +
+    const safeText = function(val) {
+      const s = String(val || "");
+      if (s.startsWith("=") || s.startsWith("+") || (s.startsWith("0") && s.length > 1)) {
+        return "'" + s;
+      }
+      return s;
+    };
 
     if (DEDUPLICATE_SAME_DAY && phoneNumber) {
-      const existingRowIndex = findRowByDateAndPhone(sheet, dateStr, phoneNumber);
+      const existingRowIndex = findRowByDateAndPhone(sheet, dateStr, phoneNumber, timezone);
       if (existingRowIndex > 0) {
+        const existingAgent = sheet.getRange(existingRowIndex, 8).getValue();
+        const existingStatus = sheet.getRange(existingRowIndex, 9).getValue();
+        
         sheet.getRange(existingRowIndex, 2).setValue(timestampStr);
-        sheet.getRange(existingRowIndex, 7).setValue(messageSummary);
-        sheet.getRange(existingRowIndex, 8).setValue(agentAssigned);
-        sheet.getRange(existingRowIndex, 9).setValue(status);
+        sheet.getRange(existingRowIndex, 7).setValue(safeText(messageSummary));
+        sheet.getRange(existingRowIndex, 8).setValue(agentAssigned !== "Unassigned" ? agentAssigned : existingAgent);
+        sheet.getRange(existingRowIndex, 9).setValue(status !== "New" ? status : existingStatus);
+        
+        SpreadsheetApp.flush();
         return createJsonResponse({ status: "updated", row: existingRowIndex });
       }
     }
@@ -282,15 +365,16 @@ function doPost(e) {
     sheet.appendRow([
       dateStr,
       timestampStr,
-      inquiryId,
-      customerName,
-      phoneNumber,
-      sourceCampaign,
-      messageSummary,
-      agentAssigned,
-      status
+      safeText(inquiryId),
+      safeText(customerName),
+      safeText(phoneNumber),
+      safeText(sourceCampaign),
+      safeText(messageSummary),
+      safeText(agentAssigned),
+      safeText(status)
     ]);
 
+    SpreadsheetApp.flush();
     return createJsonResponse({ status: "success", action: "appended" });
 
   } catch (error) {
@@ -300,13 +384,14 @@ function doPost(e) {
   }
 }
 
-function findRowByDateAndPhone(sheet, dateStr, phoneNumber) {
+function findRowByDateAndPhone(sheet, dateStr, phoneNumber, timezone) {
   const data = sheet.getDataRange().getValues();
   for (let i = 1; i < data.length; i++) {
     const rowDate = data[i][0] instanceof Date 
-      ? Utilities.formatDate(data[i][0], SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), "yyyy-MM-dd")
+      ? Utilities.formatDate(data[i][0], timezone, "yyyy-MM-dd")
       : String(data[i][0]);
-    const rowPhone = String(data[i][4]);
+    const rowPhone = String(data[i][4]).replace(/^'/, "");
+    
     if (rowDate === dateStr && rowPhone === phoneNumber) {
       return i + 1;
     }
@@ -335,36 +420,51 @@ function createJsonResponse(obj) {
                   SheetFlow AI
                 </span>
                 <span className="text-xs bg-emerald-500/10 text-emerald-400 font-medium px-2 py-0.5 rounded-full border border-emerald-500/20">
-                  WhatsApp Automation
+                  Secure Automation Cockpit
                 </span>
               </div>
               <p className="text-xs text-slate-400 hidden sm:block">
-                Sync 3rd-party WhatsApp inquiries into Google Sheets automatically
+                Protected WhatsApp-to-Sheets Sync & Webhook Simulator
               </p>
             </div>
           </div>
 
           <div className="flex items-center space-x-3">
+            {/* Staff Token Input */}
+            <div className="hidden lg:flex items-center space-x-2 bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5">
+              <Key className="w-3.5 h-3.5 text-amber-400" />
+              <span className="text-xs text-slate-400 font-medium">Staff Token:</span>
+              <input
+                type="password"
+                value={staffToken}
+                onChange={(e) => handleSaveToken(e.target.value)}
+                placeholder="STAFF_API_KEY"
+                className="bg-transparent text-xs text-white font-mono focus:outline-none w-28"
+              />
+            </div>
+
             <button
               onClick={() => setActiveTab('webhook')}
-              className="hidden md:inline-flex items-center space-x-2 bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 py-2 rounded-lg text-sm font-medium transition shadow-sm hover:shadow-emerald-900/30 shadow-emerald-900/20"
+              className="inline-flex items-center space-x-2 bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 py-2 rounded-lg text-sm font-medium transition shadow-sm"
             >
               <Webhook className="w-4 h-4" />
-              <span>Test Webhook Sandbox</span>
+              <span className="hidden sm:inline">Webhook Sandbox</span>
             </button>
-            <button
-              onClick={handleResetData}
-              title="Reset Demo Inquiries"
-              className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
-            >
-              <RefreshCw className="w-4 h-4" />
-            </button>
+            {dataMode === 'demo' && (
+              <button
+                onClick={handleResetData}
+                title="Reset Demo Inquiries"
+                className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
+              >
+                <RefreshCw className="w-4 h-4" />
+              </button>
+            )}
           </div>
         </div>
 
-        {/* Sub-navbar Tabs */}
-        <div className="bg-slate-900/80 backdrop-blur border-t border-slate-800/80 px-4 sm:px-6 lg:px-8 overflow-x-auto">
-          <div className="max-w-7xl mx-auto flex space-x-1 py-2">
+        {/* Sub-navbar Tabs & Data Mode Toggle */}
+        <div className="bg-slate-900/80 backdrop-blur border-t border-slate-800/80 px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between">
+          <div className="flex space-x-1 py-2 overflow-x-auto w-full sm:w-auto">
             {[
               { id: 'dashboard', label: 'Live Dashboard', icon: BarChart3 },
               { id: 'simulator', label: 'Google Sheets Simulator', icon: FileSpreadsheet },
@@ -379,7 +479,7 @@ function createJsonResponse(obj) {
                 <button
                   key={tab.id}
                   onClick={() => setActiveTab(tab.id as any)}
-                  className={`flex items-center space-x-2 px-3.5 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition ${
+                  className={`flex items-center space-x-2 px-3 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition ${
                     isActive
                       ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 shadow-sm'
                       : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
@@ -391,15 +491,60 @@ function createJsonResponse(obj) {
               );
             })}
           </div>
+
+          {/* Data Mode Switcher Banner */}
+          <div className="py-2 flex items-center space-x-2">
+            <span className="text-xs text-slate-400 font-medium">Data View:</span>
+            <div className="bg-slate-950 border border-slate-800 rounded-lg p-1 flex space-x-1">
+              <button
+                onClick={() => setDataMode('demo')}
+                className={`px-3 py-1 rounded text-xs font-semibold transition ${
+                  dataMode === 'demo'
+                    ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                Demo Sandbox
+              </button>
+              <button
+                onClick={() => setDataMode('live')}
+                className={`px-3 py-1 rounded text-xs font-semibold transition ${
+                  dataMode === 'live'
+                    ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                Live Inquiries DB
+              </button>
+            </div>
+          </div>
         </div>
       </header>
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8">
+        {errorMsg && (
+          <div className="mb-6 bg-red-500/10 border border-red-500/20 text-red-400 p-4 rounded-xl text-sm flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <Shield className="w-5 h-5 text-red-400" />
+              <span><strong>Authentication Error:</strong> {errorMsg}. Please check your staff token.</span>
+            </div>
+            <button
+              onClick={() => {
+                const token = prompt('Enter valid STAFF_API_KEY:');
+                if (token) handleSaveToken(token);
+              }}
+              className="bg-red-600 hover:bg-red-500 text-white px-3 py-1.5 rounded text-xs font-medium transition"
+            >
+              Update Token
+            </button>
+          </div>
+        )}
+
         {loading ? (
           <div className="flex flex-col items-center justify-center py-24 space-y-4">
             <div className="w-10 h-10 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin"></div>
-            <p className="text-slate-400 text-sm">Loading automation cockpit...</p>
+            <p className="text-slate-400 text-sm">Authenticating and loading records...</p>
           </div>
         ) : (
           <>
@@ -408,13 +553,23 @@ function createJsonResponse(obj) {
               <div className="space-y-6 animate-fadeIn">
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
                   <div>
-                    <h1 className="text-2xl font-bold text-white tracking-tight">Automation Overview</h1>
-                    <p className="text-sm text-slate-400">Real-time metrics synced from your WhatsApp integrations</p>
+                    <div className="flex items-center space-x-2">
+                      <h1 className="text-2xl font-bold text-white tracking-tight">Automation Overview</h1>
+                      <span className={`px-2.5 py-0.5 rounded-full text-xs font-semibold ${
+                        dataMode === 'live' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                      }`}>
+                        {dataMode === 'live' ? '🟢 Live Inquiries Mode' : '🟡 Demo Sandbox Mode'}
+                      </span>
+                    </div>
+                    <p className="text-sm text-slate-400">
+                      {dataMode === 'live' ? 'Displaying durable live WhatsApp inquiries accepted via secure webhooks.' : 'Displaying in-memory sample records for safe simulator testing.'}
+                    </p>
                   </div>
+                  
                   <div className="flex items-center space-x-3">
                     <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                       <span className="w-2 h-2 rounded-full bg-emerald-400 mr-2 animate-pulse"></span>
-                      Webhook Listener Active
+                      Webhook Secret Verified
                     </span>
                     <button
                       onClick={() => setActiveTab('webhook')}
@@ -437,7 +592,7 @@ function createJsonResponse(obj) {
                     </div>
                     <div className="mt-3 flex items-baseline">
                       <span className="text-3xl font-extrabold text-white">{totalInquiriesCount}</span>
-                      <span className="ml-2 text-xs text-emerald-400 font-medium">+12% today</span>
+                      <span className="ml-2 text-xs text-emerald-400 font-medium">Asia/KL Time</span>
                     </div>
                     <p className="mt-1 text-xs text-slate-400">Logged in `Raw_Inquiries`</p>
                   </div>
@@ -453,14 +608,14 @@ function createJsonResponse(obj) {
                       <span className="text-3xl font-extrabold text-white">{uniqueLeadsCount}</span>
                       <span className="ml-2 text-xs text-blue-400 font-medium">Distinct phone #</span>
                     </div>
-                    <p className="mt-1 text-xs text-slate-400">Deduplicated automatically</p>
+                    <p className="mt-1 text-xs text-slate-400">Deduplicated same-day</p>
                   </div>
 
                   <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm hover:border-slate-700 transition">
                     <div className="flex items-center justify-between">
                       <span className="text-xs font-medium uppercase tracking-wider text-slate-400">Closed Won</span>
                       <div className="p-2 rounded-lg bg-purple-500/10 text-purple-400">
-                        <CheckCircle2 className="w-5 h-5" />
+                        <Check className="w-5 h-5" />
                       </div>
                     </div>
                     <div className="mt-3 flex items-baseline">
@@ -481,126 +636,67 @@ function createJsonResponse(obj) {
                       <span className="text-3xl font-extrabold text-white">{conversionRate}%</span>
                       <span className="ml-2 text-xs text-amber-400 font-medium">Target: 25%</span>
                     </div>
-                    <p className="mt-1 text-xs text-slate-400">Calculated via sheet formula</p>
+                    <p className="mt-1 text-xs text-slate-400">Calculated formula</p>
                   </div>
                 </div>
 
-                {/* Quick Shortcuts & Architecture */}
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                  {/* Recent Activity Stream */}
-                  <div className="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
-                    <div className="flex items-center justify-between mb-4">
-                      <h2 className="text-base font-bold text-white flex items-center space-x-2">
-                        <MessageSquare className="w-4 h-4 text-emerald-400" />
-                        <span>Recent WhatsApp Inquiries</span>
-                      </h2>
-                      <button
-                        onClick={() => setActiveTab('simulator')}
-                        className="text-xs text-emerald-400 hover:text-emerald-300 font-medium flex items-center space-x-1"
-                      >
-                        <span>View All in Sheet</span>
-                        <ArrowUpRight className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-left text-sm">
-                        <thead>
-                          <tr className="border-b border-slate-800 text-xs text-slate-400 uppercase tracking-wider">
-                            <th className="pb-3 font-semibold">Customer</th>
-                            <th className="pb-3 font-semibold">Campaign</th>
-                            <th className="pb-3 font-semibold">Agent</th>
-                            <th className="pb-3 font-semibold">Status</th>
-                            <th className="pb-3 font-semibold text-right">Time</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-800/60">
-                          {inquiries.slice(0, 5).map((item, idx) => (
-                            <tr key={idx} className="hover:bg-slate-800/30 transition">
-                              <td className="py-3 pr-3">
-                                <div className="font-medium text-white">{item.customerName}</div>
-                                <div className="text-xs text-slate-400">{item.phoneNumber}</div>
-                              </td>
-                              <td className="py-3 pr-3">
-                                <span className="inline-block px-2 py-0.5 rounded text-xs bg-slate-800 text-slate-300 font-mono">
-                                  {item.sourceCampaign}
-                                </span>
-                              </td>
-                              <td className="py-3 pr-3 text-slate-300 text-xs">{item.agentAssigned}</td>
-                              <td className="py-3 pr-3">
-                                <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
-                                  item.status === 'Closed' ? 'bg-purple-500/10 text-purple-400 border border-purple-500/20' :
-                                  item.status === 'Qualified' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
-                                  item.status === 'In Progress' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
-                                  'bg-slate-800 text-slate-300'
-                                }`}>
-                                  {item.status}
-                                </span>
-                              </td>
-                              <td className="py-3 text-right text-xs text-slate-400 font-mono">
-                                {item.timestamp.substring(11, 16)}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
+                {/* Recent Activity Stream */}
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
+                  <div className="flex items-center justify-between mb-4">
+                    <h2 className="text-base font-bold text-white flex items-center space-x-2">
+                      <MessageSquare className="w-4 h-4 text-emerald-400" />
+                      <span>Recent WhatsApp Inquiries ({dataMode.toUpperCase()})</span>
+                    </h2>
+                    <button
+                      onClick={() => setActiveTab('simulator')}
+                      className="text-xs text-emerald-400 hover:text-emerald-300 font-medium flex items-center space-x-1"
+                    >
+                      <span>View All in Sheet</span>
+                      <ArrowUpRight className="w-3.5 h-3.5" />
+                    </button>
                   </div>
 
-                  {/* Architecture & Quick Actions */}
-                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm flex flex-col justify-between">
-                    <div>
-                      <h2 className="text-base font-bold text-white mb-3 flex items-center space-x-2">
-                        <Layers className="w-4 h-4 text-teal-400" />
-                        <span>Integration Stack</span>
-                      </h2>
-                      <div className="space-y-3 text-sm text-slate-300">
-                        <div className="flex items-start space-x-3 p-3 rounded-lg bg-slate-800/50 border border-slate-800">
-                          <div className="p-1.5 rounded bg-emerald-500/10 text-emerald-400 mt-0.5">
-                            <Webhook className="w-4 h-4" />
-                          </div>
-                          <div>
-                            <div className="font-semibold text-white text-xs">1. 3rd-Party Webhook</div>
-                            <div className="text-xs text-slate-400">ManyChat, Wati, Respond.io, or SleekFlow triggers payload on message.</div>
-                          </div>
-                        </div>
-
-                        <div className="flex items-start space-x-3 p-3 rounded-lg bg-slate-800/50 border border-slate-800">
-                          <div className="p-1.5 rounded bg-blue-500/10 text-blue-400 mt-0.5">
-                            <Code className="w-4 h-4" />
-                          </div>
-                          <div>
-                            <div className="font-semibold text-white text-xs">2. Google Apps Script</div>
-                            <div className="text-xs text-slate-400">`doPost(e)` parses JSON, handles deduplication, and appends rows.</div>
-                          </div>
-                        </div>
-
-                        <div className="flex items-start space-x-3 p-3 rounded-lg bg-slate-800/50 border border-slate-800">
-                          <div className="p-1.5 rounded bg-purple-500/10 text-purple-400 mt-0.5">
-                            <FileSpreadsheet className="w-4 h-4" />
-                          </div>
-                          <div>
-                            <div className="font-semibold text-white text-xs">3. Google Sheets Rollup</div>
-                            <div className="text-xs text-slate-400">`Raw_Inquiries` & `Daily_Summary` calculate KPIs automatically.</div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="mt-6 pt-4 border-t border-slate-800 flex space-x-2">
-                      <button
-                        onClick={() => setActiveTab('gas')}
-                        className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white py-2 px-3 rounded-lg text-xs font-semibold transition text-center"
-                      >
-                        Get Apps Script Code
-                      </button>
-                      <button
-                        onClick={() => setActiveTab('blueprint')}
-                        className="bg-slate-800 hover:bg-slate-700 text-slate-200 py-2 px-3 rounded-lg text-xs font-semibold transition"
-                      >
-                        Read Guide
-                      </button>
-                    </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                      <thead>
+                        <tr className="border-b border-slate-800 text-xs text-slate-400 uppercase tracking-wider">
+                          <th className="pb-3 font-semibold">Customer</th>
+                          <th className="pb-3 font-semibold">Campaign</th>
+                          <th className="pb-3 font-semibold">Agent</th>
+                          <th className="pb-3 font-semibold">Status</th>
+                          <th className="pb-3 font-semibold text-right">Timestamp</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/60">
+                        {inquiries.slice(0, 5).map((item, idx) => (
+                          <tr key={idx} className="hover:bg-slate-800/30 transition">
+                            <td className="py-3 pr-3">
+                              <div className="font-medium text-white">{item.customerName}</div>
+                              <div className="text-xs text-slate-400 font-mono">{item.phoneNumber}</div>
+                            </td>
+                            <td className="py-3 pr-3">
+                              <span className="inline-block px-2 py-0.5 rounded text-xs bg-slate-800 text-slate-300 font-mono">
+                                {item.sourceCampaign}
+                              </span>
+                            </td>
+                            <td className="py-3 pr-3 text-slate-300 text-xs">{item.agentAssigned}</td>
+                            <td className="py-3 pr-3">
+                              <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                                item.status === 'Closed' ? 'bg-purple-500/10 text-purple-400 border border-purple-500/20' :
+                                item.status === 'Qualified' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
+                                item.status === 'In Progress' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
+                                'bg-slate-800 text-slate-300'
+                              }`}>
+                                {item.status}
+                              </span>
+                            </td>
+                            <td className="py-3 text-right text-xs text-slate-400 font-mono">
+                              {item.timestamp}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
                 </div>
               </div>
@@ -612,7 +708,7 @@ function createJsonResponse(obj) {
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
                   <div>
                     <h1 className="text-2xl font-bold text-white tracking-tight">Google Sheets Simulator</h1>
-                    <p className="text-sm text-slate-400">Live preview of your Google Sheet structure (`Raw_Inquiries` & `Daily_Summary` tabs)</p>
+                    <p className="text-sm text-slate-400">Live preview of your Google Sheet structure (`Raw_Inquiries` & `Daily_Summary`)</p>
                   </div>
                   
                   <div className="flex items-center space-x-2 bg-slate-900 border border-slate-800 p-1 rounded-xl">
@@ -679,7 +775,7 @@ function createJsonResponse(obj) {
                             const encodedUri = encodeURI(csvContent);
                             const link = document.createElement("a");
                             link.setAttribute("href", encodedUri);
-                            link.setAttribute("download", "Raw_Inquiries_Export.csv");
+                            link.setAttribute("download", `Raw_Inquiries_${dataMode}.csv`);
                             document.body.appendChild(link);
                             link.click();
                             document.body.removeChild(link);
@@ -712,7 +808,7 @@ function createJsonResponse(obj) {
                           {filteredInquiries.length === 0 ? (
                             <tr>
                               <td colSpan={9} className="text-center py-12 text-slate-500">
-                                No matching inquiries found. Try clearing filters or send a test webhook.
+                                No matching inquiries found. Try clearing filters or submit a webhook.
                               </td>
                             </tr>
                           ) : (
@@ -757,7 +853,7 @@ function createJsonResponse(obj) {
                         <p className="text-xs text-slate-400">Automated daily metrics powered by Google Sheets formulas</p>
                       </div>
                       <span className="text-xs font-mono bg-slate-800 text-emerald-400 px-3 py-1 rounded-lg">
-                        Formulas Active
+                        Asia/Kuala_Lumpur
                       </span>
                     </div>
 
@@ -809,7 +905,7 @@ function createJsonResponse(obj) {
               <div className="space-y-6 animate-fadeIn">
                 <div>
                   <h1 className="text-2xl font-bold text-white tracking-tight">Webhook Tester & Sandbox</h1>
-                  <p className="text-sm text-slate-400">Test incoming JSON payloads from WhatsApp platforms against your local automation endpoint</p>
+                  <p className="text-sm text-slate-400">Test incoming JSON payloads from 4 major WhatsApp CRM presets securely</p>
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -818,9 +914,9 @@ function createJsonResponse(obj) {
                     <div className="flex items-center justify-between">
                       <h2 className="text-base font-bold text-white flex items-center space-x-2">
                         <Webhook className="w-4 h-4 text-emerald-400" />
-                        <span>Select Platform Preset</span>
+                        <span>Select CRM Preset</span>
                       </h2>
-                      <span className="text-xs text-slate-400 font-mono">POST /api/webhook/whatsapp</span>
+                      <span className="text-xs text-slate-400 font-mono">Authenticated via /api/simulator/send</span>
                     </div>
 
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -846,7 +942,7 @@ function createJsonResponse(obj) {
 
                     <div className="space-y-2">
                       <label className="text-xs font-medium text-slate-300 uppercase tracking-wider">
-                        JSON Payload Editor
+                        JSON Payload Editor (Supports Respond.io & SleekFlow formats)
                       </label>
                       <textarea
                         rows={10}
@@ -857,19 +953,19 @@ function createJsonResponse(obj) {
                     </div>
 
                     <button
-                      onClick={handleSendWebhook}
+                      onClick={handleSendSimulatorWebhook}
                       disabled={isSendingWebhook}
                       className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-medium py-2.5 px-4 rounded-lg text-sm transition flex items-center justify-center space-x-2 shadow-lg shadow-emerald-950/50"
                     >
                       {isSendingWebhook ? (
                         <>
                           <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                          <span>Sending Webhook...</span>
+                          <span>Simulating Webhook Delivery...</span>
                         </>
                       ) : (
                         <>
                           <Play className="w-4 h-4 fill-current" />
-                          <span>Send Test Webhook Now</span>
+                          <span>Simulate Webhook Delivery</span>
                         </>
                       )}
                     </button>
@@ -880,7 +976,7 @@ function createJsonResponse(obj) {
                     <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
                       <h2 className="text-base font-bold text-white flex items-center space-x-2">
                         <Terminal className="w-4 h-4 text-amber-400" />
-                        <span>Webhook Execution Response</span>
+                        <span>Execution Response</span>
                       </h2>
 
                       {webhookResponse ? (
@@ -903,23 +999,23 @@ function createJsonResponse(obj) {
                             </pre>
                           </div>
                           <p className="text-xs text-slate-400">
-                            ✨ Check the <button onClick={() => setActiveTab('simulator')} className="text-emerald-400 underline hover:text-emerald-300">Google Sheets Simulator</button> tab to see your new row instantly reflected!
+                            ✨ Check the <button onClick={() => setActiveTab('simulator')} className="text-emerald-400 underline hover:text-emerald-300">Google Sheets Simulator</button> tab to view the updated record!
                           </p>
                         </div>
                       ) : (
                         <div className="text-center py-12 text-slate-500 text-sm">
-                          Click "Send Test Webhook Now" to test payload parsing and deduplication.
+                          Click "Simulate Webhook Delivery" to test payload parsing, strict phone validation, and deduplication.
                         </div>
                       )}
                     </div>
 
                     <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm space-y-3">
                       <h3 className="text-sm font-bold text-white flex items-center space-x-2">
-                        <HelpCircle className="w-4 h-4 text-teal-400" />
-                        <span>Production Deployment Tip</span>
+                        <Lock className="w-4 h-4 text-teal-400" />
+                        <span>Live Production Webhook Endpoint</span>
                       </h3>
                       <p className="text-xs text-slate-300 leading-relaxed">
-                        Once you deploy your Google Apps Script as a Web App (as detailed in the <button onClick={() => setActiveTab('blueprint')} className="text-emerald-400 underline">Technical Blueprint</button>), paste your live Google Web App URL into your WhatsApp CRM's Outgoing Webhook settings.
+                        For live WhatsApp traffic, your CRM sends payloads to <code className="text-emerald-400 font-mono">/api/webhook/whatsapp?secret=YOUR_WEBHOOK_SECRET</code> (or with header <code className="text-emerald-400 font-mono">X-Webhook-Secret</code>).
                       </p>
                     </div>
                   </div>
@@ -933,7 +1029,7 @@ function createJsonResponse(obj) {
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
                   <div>
                     <h1 className="text-2xl font-bold text-white tracking-tight">Google Apps Script Generator</h1>
-                    <p className="text-sm text-slate-400">Configure and copy your customized `Code.gs` webhook receiver script</p>
+                    <p className="text-sm text-slate-400">Secure production <code className="text-emerald-400 font-mono">Code.gs</code> script with SPREADSHEET_ID and Secret verification</p>
                   </div>
 
                   <button
@@ -945,12 +1041,25 @@ function createJsonResponse(obj) {
                     className="inline-flex items-center space-x-2 bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition shadow-sm"
                   >
                     {copiedCode ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-                    <span>{copiedCode ? 'Copied to Clipboard!' : 'Copy Code.gs'}</span>
+                    <span>{copiedCode ? 'Copied Code.gs!' : 'Copy Secure Code.gs'}</span>
                   </button>
                 </div>
 
                 {/* Configuration Options */}
-                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 uppercase tracking-wider mb-2">
+                      Destination Spreadsheet ID
+                    </label>
+                    <input
+                      type="text"
+                      value={gasSpreadsheetId}
+                      onChange={(e) => setGasSpreadsheetId(e.target.value)}
+                      placeholder="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500 transition font-mono"
+                    />
+                  </div>
+
                   <div>
                     <label className="block text-xs font-medium text-slate-300 uppercase tracking-wider mb-2">
                       Target Sheet Name
@@ -966,7 +1075,7 @@ function createJsonResponse(obj) {
                   <div className="flex items-center justify-between bg-slate-950 border border-slate-800 rounded-lg p-3">
                     <div>
                       <div className="text-sm font-medium text-white">Same-Day Deduplication</div>
-                      <div className="text-xs text-slate-400">Update existing row if phone inures twice on same date</div>
+                      <div className="text-xs text-slate-400">Preserves agent/status on repeat inquiry</div>
                     </div>
                     <input
                       type="checkbox"
@@ -980,8 +1089,8 @@ function createJsonResponse(obj) {
                 {/* Code Preview Box */}
                 <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-sm">
                   <div className="p-4 border-b border-slate-800 flex items-center justify-between">
-                    <span className="text-xs font-mono text-slate-400">Code.gs (Google Apps Script)</span>
-                    <span className="text-xs text-emerald-400 font-mono">Ready for Deployment</span>
+                    <span className="text-xs font-mono text-slate-400">Code.gs (Google Apps Script - Production Secure)</span>
+                    <span className="text-xs text-emerald-400 font-mono">Explicit ID + LockService + Text Safety</span>
                   </div>
                   <div className="p-4 bg-slate-950 overflow-x-auto max-h-96">
                     <pre className="text-xs font-mono text-emerald-300 leading-relaxed">
@@ -997,11 +1106,10 @@ function createJsonResponse(obj) {
                     <span>Apps Script Deployment Checklist</span>
                   </h3>
                   <ol className="list-decimal list-inside space-y-2 text-xs text-slate-300">
-                    <li>Open your Google Sheet, navigate to <strong className="text-white">Extensions &gt; Apps Script</strong>.</li>
-                    <li>Paste the code above into <code className="text-emerald-400 font-mono">Code.gs</code>.</li>
-                    <li>Click <strong className="text-white">Deploy &gt; New deployment</strong>, select type <strong className="text-white">Web app</strong>.</li>
-                    <li>Set Execute as: <strong className="text-white">Me</strong> and Who has access: <strong className="text-white">Anyone</strong>.</li>
-                    <li>Copy the Web App URL and paste it into your 3rd-party WhatsApp platform webhook settings.</li>
+                    <li>Open your Google Sheet, navigate to <strong className="text-white">Extensions &gt; Apps Script</strong> and paste <code className="text-emerald-400 font-mono">Code.gs</code>.</li>
+                    <li>Go to <strong className="text-white">Project Settings (Gear icon) &gt; Script Properties</strong>, add property <code className="text-emerald-400 font-mono">WHATSAPP_WEBHOOK_SECRET</code> with your secret token.</li>
+                    <li>Click <strong className="text-white">Deploy &gt; New deployment</strong> &gt; Web app (Execute as: <strong className="text-white">Me</strong>, Who has access: <strong className="text-white">Anyone</strong>).</li>
+                    <li>Configure your WhatsApp CRM webhook URL as: <code className="text-emerald-400 font-mono">https://script.google.com/macros/s/.../exec?secret=YOUR_WEBHOOK_SECRET</code>.</li>
                   </ol>
                 </div>
               </div>
@@ -1012,7 +1120,14 @@ function createJsonResponse(obj) {
               <div className="space-y-6 animate-fadeIn">
                 <div>
                   <h1 className="text-2xl font-bold text-white tracking-tight">AI Payload Mapper & Assistant</h1>
-                  <p className="text-sm text-slate-400">Powered by Gemini AI to inspect custom webhook JSON structures and generate extraction code</p>
+                  <p className="text-sm text-slate-400">Privacy-sanitized Gemini AI mapper for generating custom Apps Script extraction logic</p>
+                </div>
+
+                <div className="bg-amber-500/10 border border-amber-500/20 text-amber-300 p-4 rounded-xl text-xs flex items-start space-x-3">
+                  <Shield className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+                  <div>
+                    <strong className="font-semibold text-white">Privacy Protection Notice:</strong> Before sending sample JSON payloads to Gemini, customer names, phone numbers, emails, and sensitive keys are automatically anonymized on the server while preserving nesting, field names, arrays, and data types.
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -1055,7 +1170,7 @@ function createJsonResponse(obj) {
                       {isAnalyzing ? (
                         <>
                           <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                          <span>Analyzing with Gemini AI...</span>
+                          <span>Sanitizing & Analyzing with Gemini...</span>
                         </>
                       ) : (
                         <>
@@ -1081,7 +1196,7 @@ function createJsonResponse(obj) {
                       </div>
                     ) : (
                       <div className="text-center py-16 text-slate-500 text-sm">
-                        Enter your platform JSON payload and click "Generate Custom Mapping Code" to receive AI extraction logic.
+                        Enter your platform JSON payload and click "Generate Custom Mapping Code" to receive privacy-compliant extraction logic.
                       </div>
                     )}
                   </div>
@@ -1094,8 +1209,8 @@ function createJsonResponse(obj) {
               <div className="space-y-6 animate-fadeIn">
                 <div className="flex items-center justify-between">
                   <div>
-                    <h1 className="text-2xl font-bold text-white tracking-tight">Technical Blueprint & Guide</h1>
-                    <p className="text-sm text-slate-400">Complete architectural specification and step-by-step implementation guide</p>
+                    <h1 className="text-2xl font-bold text-white tracking-tight">Technical Blueprint & Security Architecture</h1>
+                    <p className="text-sm text-slate-400">Complete security, locking, timezone, and CRM mapping specifications</p>
                   </div>
                   <a
                     href="/public/assets/aistudio/whatsapp_inquiry_to_google_sheets_automation_blueprint_8d9b025b.md"
@@ -1103,60 +1218,34 @@ function createJsonResponse(obj) {
                     rel="noreferrer"
                     className="inline-flex items-center space-x-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 px-3.5 py-2 rounded-lg text-sm font-medium transition"
                   >
-                    <span>Open Raw Markdown</span>
+                    <span>Open Raw Markdown Guide</span>
                     <ExternalLink className="w-4 h-4" />
                   </a>
                 </div>
 
                 <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 sm:p-8 space-y-6 text-slate-300 leading-relaxed text-sm">
                   <div className="border-b border-slate-800 pb-4">
-                    <h2 className="text-xl font-bold text-white mb-2">1. Recommended Google Sheet Structure</h2>
-                    <p className="text-slate-400 mb-3">Organize your existing Google Sheet into two tabs:</p>
-                    <ul className="list-disc list-inside space-y-1.5 text-slate-300">
-                      <li><strong className="text-white">`Raw_Inquiries`</strong> (Automated Data Log): Columns: <code className="text-emerald-400 font-mono text-xs">Date | Timestamp | Inquiry_ID | Customer_Name | Phone_Number | Source_Campaign | Message_Summary | Agent_Assigned | Status</code></li>
-                      <li><strong className="text-white">`Daily_Summary`</strong> (Automated Daily Rollup): Columns: <code className="text-emerald-400 font-mono text-xs">Date | Total_Inquiries | Unique_Leads | Qualified_Leads | Closed_Won | Conversion_Rate</code></li>
-                    </ul>
-                  </div>
-
-                  <div className="border-b border-slate-800 pb-4">
-                    <h2 className="text-xl font-bold text-white mb-2">2. Approach A: Real-Time Webhook + Google Apps Script</h2>
-                    <p className="text-slate-400 mb-2">Best if your third-party WhatsApp platform supports Outgoing Webhooks (JSON payloads triggered on new messages).</p>
-                    <div className="bg-slate-950 p-4 rounded-lg font-mono text-xs text-emerald-300 space-y-1">
-                      <div>// 1. Open Google Sheet &gt; Extensions &gt; Apps Script</div>
-                      <div>// 2. Paste doPost(e) webhook receiver with LockService & deduplication</div>
-                      <div>// 3. Deploy as Web App &gt; Execute as Me &gt; Access: Anyone</div>
-                    </div>
-                  </div>
-
-                  <div className="border-b border-slate-800 pb-4">
-                    <h2 className="text-xl font-bold text-white mb-2">3. Approach B: Scheduled Daily Batch Sync (API Polling)</h2>
+                    <h2 className="text-xl font-bold text-white mb-2">1. Security & Authentication</h2>
                     <p className="text-slate-400">
-                      Best if your third-party platform does not support webhooks and requires fetching data via REST API once per day at 23:55 using Make.com, n8n, or time-driven Apps Script triggers.
+                      Protected endpoints enforce staff token verification (`x-staff-token`). Live webhooks require `WHATSAPP_WEBHOOK_SECRET` verification. Gemini AI calls are rate-limited and preceded by strict JSON privacy sanitization.
+                    </p>
+                  </div>
+
+                  <div className="border-b border-slate-800 pb-4">
+                    <h2 className="text-xl font-bold text-white mb-2">2. Concurrency & Formula Injection Safety</h2>
+                    <p className="text-slate-400">
+                      Apps Script utilizes `LockService.getScriptLock().tryLock(10000)` with timeout handling and `SpreadsheetApp.flush()`. Incoming strings starting with `=`, `+`, or leading zeros are prefixed with `'` to preserve literal text.
                     </p>
                   </div>
 
                   <div>
-                    <h2 className="text-xl font-bold text-white mb-2">4. Automating the `Daily_Summary` Tab Formulas</h2>
-                    <div className="space-y-3">
-                      <div>
-                        <div className="text-xs text-slate-400 font-semibold mb-1">Column A (Date):</div>
-                        <div className="bg-slate-950 p-3 rounded-lg font-mono text-xs text-emerald-400 overflow-x-auto">
-                          =SORT(UNIQUE(FILTER(Raw_Inquiries!A2:A, Raw_Inquiries!A2:A &lt;&gt; "")), 1, FALSE)
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-xs text-slate-400 font-semibold mb-1">Column B (Total_Inquiries):</div>
-                        <div className="bg-slate-950 p-3 rounded-lg font-mono text-xs text-emerald-400 overflow-x-auto">
-                          =IF(A2="", "", COUNTIF(Raw_Inquiries!$A$2:$A, A2))
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-xs text-slate-400 font-semibold mb-1">Column E (Conversion_Rate):</div>
-                        <div className="bg-slate-950 p-3 rounded-lg font-mono text-xs text-emerald-400 overflow-x-auto">
-                          =IF(B2=0, 0, D2/B2)
-                        </div>
-                      </div>
-                    </div>
+                    <h2 className="text-xl font-bold text-white mb-2">3. Supported CRM Presets</h2>
+                    <ul className="list-disc list-inside space-y-1 text-slate-300">
+                      <li><strong>ManyChat:</strong> `contact.name`, `contact.phone`</li>
+                      <li><strong>Wati:</strong> `name`, `phone`</li>
+                      <li><strong>Respond.io:</strong> `contact.full_name`, `contact.phone`</li>
+                      <li><strong>SleekFlow:</strong> `customer.full_name`, `customer.phone`</li>
+                    </ul>
                   </div>
                 </div>
               </div>
@@ -1167,7 +1256,7 @@ function createJsonResponse(obj) {
 
       {/* Footer */}
       <footer className="bg-slate-900 border-t border-slate-800 py-4 text-center text-xs text-slate-500">
-        <p>WhatsApp Sheets Automation Hub • Powered by Google AI Studio & Apps Script</p>
+        <p>WhatsApp Sheets Automation Hub • Secure Production Edition</p>
       </footer>
     </div>
   );
