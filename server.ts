@@ -52,19 +52,6 @@ let demoInquiries: InquiryRecord[] = [
   }
 ];
 
-// One-time migration procedure for legacy JSON file if present
-function migrateLegacyJsonIfNeeded() {
-  try {
-    if (fs.existsSync(LEGACY_JSON_FILE)) {
-      console.log('Found legacy live_inquiries.json store. Preserving securely outside web root.');
-      // The file is kept in data/ which is gitignored and not served by express static.
-    }
-  } catch (err) {
-    console.error('Migration check error:', err);
-  }
-}
-migrateLegacyJsonIfNeeded();
-
 // Get current date & timestamp in Asia/Kuala_Lumpur
 function getMalaysiaDateTime() {
   const now = new Date();
@@ -144,15 +131,15 @@ const staffAuth = (req: express.Request, res: express.Response, next: express.Ne
   next();
 };
 
-// Webhook Secret Verification Middleware
+// CRM Webhook Secret Verification Middleware (Header only: X-Webhook-Secret)
 const verifyWebhookSecret = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET;
   if (!webhookSecret || webhookSecret.trim() === '' || webhookSecret === 'my_whatsapp_webhook_secret') {
-    return res.status(503).json({ success: false, error: 'WHATSAPP_WEBHOOK_SECRET is not configured or uses insecure example value on server.' });
+    return res.status(503).json({ status: 'error', code: 'CONFIG_ERROR', message: 'WHATSAPP_WEBHOOK_SECRET is not configured on server.' });
   }
-  const providedSecret = req.headers['x-webhook-secret'] || req.query.secret || req.headers['authorization']?.replace('Bearer ', '');
+  const providedSecret = req.headers['x-webhook-secret'] || req.headers['authorization']?.replace('Bearer ', '');
   if (!providedSecret || providedSecret !== webhookSecret) {
-    return res.status(401).json({ success: false, error: 'Unauthorized: Invalid or missing webhook secret.' });
+    return res.status(401).json({ status: 'error', code: 'UNAUTHORIZED', message: 'Unauthorized: Invalid or missing inbound CRM webhook secret header.' });
   }
   next();
 };
@@ -187,19 +174,29 @@ async function startServer() {
       return res.json({ success: true, mode: 'demo', data: demoInquiries });
     }
 
-    // Live mode: Google Sheets is the source of truth via Apps Script Web App doGet
+    // Live mode: Google Sheets is source of truth via Apps Script POST envelope (operation: "read")
     const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL;
-    const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET;
+    const readSecret = process.env.APPS_SCRIPT_READ_SECRET || process.env.APPS_SCRIPT_SECRET || process.env.WHATSAPP_WEBHOOK_SECRET;
 
-    if (!appsScriptUrl || !webhookSecret) {
+    if (!appsScriptUrl || !readSecret) {
       return res.status(503).json({
         success: false,
-        error: 'Live Google Sheets integration not fully configured. Please set APPS_SCRIPT_WEB_APP_URL and WHATSAPP_WEBHOOK_SECRET.'
+        error: 'Live Google Sheets integration not fully configured. Please set APPS_SCRIPT_WEB_APP_URL and APPS_SCRIPT_READ_SECRET.'
       });
     }
 
     try {
-      const response = await fetch(`${appsScriptUrl}?action=get&secret=${encodeURIComponent(webhookSecret)}`);
+      const envelope = {
+        operation: 'read',
+        credential: readSecret
+      };
+
+      const response = await fetch(appsScriptUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(envelope)
+      });
+
       if (!response.ok) {
         throw new Error(`Apps Script responded with HTTP status ${response.status}`);
       }
@@ -213,7 +210,7 @@ async function startServer() {
       console.error('Dashboard live read error:', err);
       return res.status(502).json({
         success: false,
-        error: `Failed to load live leads from Google Sheet: ${err.toString()}`
+        error: `Failed to load live leads from Google Sheet: ${err.toString()}. Check sheet name "Raw_Inquiries" and deployment URL.`
       });
     }
   });
@@ -247,34 +244,50 @@ async function startServer() {
     res.json({ success: true, data: demoInquiries });
   });
 
-  // Live WhatsApp Webhook Endpoint (Protected by webhook secret & Google Sheets Source of Truth)
+  // Live WhatsApp Webhook Endpoint (CRM write access, verified via X-Webhook-Secret header only)
   app.post('/api/webhook/whatsapp', verifyWebhookSecret, async (req, res) => {
     try {
       const payload = req.body;
       const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL;
-      const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET;
+      const writeSecret = process.env.APPS_SCRIPT_WRITE_SECRET || process.env.APPS_SCRIPT_SECRET || process.env.WHATSAPP_WEBHOOK_SECRET;
 
-      if (!appsScriptUrl || !webhookSecret) {
-        return res.status(503).json({ status: 'error', message: 'Apps Script storage URL not configured.' });
+      if (!appsScriptUrl || !writeSecret) {
+        return res.status(503).json({ status: 'error', code: 'CONFIG_ERROR', message: 'Apps Script storage URL or write credential not configured.' });
       }
 
-      // Forward request to Google Apps Script Web App (Source of Truth)
-      const forwardUrl = `${appsScriptUrl}?secret=${encodeURIComponent(webhookSecret)}`;
-      const gsResponse = await fetch(forwardUrl, {
+      // Construct JSON POST envelope with operation "write"
+      const envelope = {
+        operation: 'write',
+        credential: writeSecret,
+        payload
+      };
+
+      const gsResponse = await fetch(appsScriptUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(envelope)
       });
 
       if (!gsResponse.ok) {
-        return res.status(502).json({ status: 'error', message: `Google Sheets storage error (HTTP ${gsResponse.status})` });
+        return res.status(502).json({ status: 'error', code: 'STORAGE_HTTP_ERROR', message: `Google Sheets storage HTTP error (${gsResponse.status})` });
       }
 
       const gsResult = await gsResponse.json();
 
-      // Inspect response body for application-level busy or error
-      if (gsResult.status === 'busy' || gsResult.status === 'error') {
-        return res.status(503).json({ status: gsResult.status, message: gsResult.message || 'Google Sheets is busy or returned an error.' });
+      // Return right error to CRM based on Apps Script stable machine-readable codes
+      if (gsResult.status === 'busy' || gsResult.code === 'BUSY') {
+        return res.status(503).json({ status: 'busy', code: 'BUSY', message: gsResult.message || 'Google Sheets is busy (lock contention).' });
+      }
+
+      if (gsResult.status === 'error') {
+        const code = gsResult.code || 'STORAGE_ERROR';
+        if (code === 'INVALID_INPUT' || code === 'INVALID_STATUS') {
+          return res.status(400).json({ status: 'error', code, message: gsResult.message || 'Invalid input or unsupported status.' });
+        }
+        if (code === 'UNAUTHORIZED') {
+          return res.status(401).json({ status: 'error', code, message: gsResult.message || 'Unauthorized Apps Script credential.' });
+        }
+        return res.status(503).json({ status: 'error', code, message: gsResult.message || 'Temporary storage error.' });
       }
 
       if (gsResult.status === 'success' || gsResult.status === 'updated') {
@@ -285,14 +298,103 @@ async function startServer() {
         });
       }
 
-      return res.status(502).json({ status: 'error', message: 'Unexpected response from Google Sheets receiver.' });
+      return res.status(502).json({ status: 'error', code: 'UNKNOWN_RESPONSE', message: 'Unexpected response from Google Sheets receiver.' });
     } catch (err: any) {
       console.error('Live webhook forwarding error:', err);
-      return res.status(503).json({ status: 'error', message: `Temporary storage unavailable: ${err.toString()}` });
+      return res.status(503).json({ status: 'error', code: 'RETRYABLE_ERROR', message: `Temporary storage unavailable: ${err.toString()}` });
     }
   });
 
-  // Authenticated Simulator Endpoint (allows UI simulator to submit sample events securely)
+  // Manually invoked migration endpoint for legacy live records
+  app.post('/api/admin/migrate-legacy', staffAuth, async (req, res) => {
+    try {
+      const { dryRun = true } = req.body || {};
+      if (!fs.existsSync(LEGACY_JSON_FILE)) {
+        return res.json({ success: true, message: 'No legacy json file found at data/live_inquiries.json.', stats: { imported: 0, skipped: 0, failed: 0 } });
+      }
+
+      const content = fs.readFileSync(LEGACY_JSON_FILE, 'utf-8');
+      const legacyRecords: InquiryRecord[] = JSON.parse(content);
+
+      if (!Array.isArray(legacyRecords) || legacyRecords.length === 0) {
+        return res.json({ success: true, message: 'Legacy file is empty.', stats: { imported: 0, skipped: 0, failed: 0 } });
+      }
+
+      const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL;
+      const writeSecret = process.env.APPS_SCRIPT_WRITE_SECRET || process.env.APPS_SCRIPT_SECRET || process.env.WHATSAPP_WEBHOOK_SECRET;
+
+      if (!appsScriptUrl || !writeSecret) {
+        return res.status(503).json({ success: false, error: 'Migration requires APPS_SCRIPT_WEB_APP_URL and write secret configured.' });
+      }
+
+      let imported = 0;
+      let skipped = 0;
+      let failed = 0;
+
+      if (dryRun) {
+        return res.json({
+          success: true,
+          dryRun: true,
+          message: `Dry run completed. Found ${legacyRecords.length} legacy records ready for migration.`,
+          stats: { imported: legacyRecords.length, skipped: 0, failed: 0 }
+        });
+      }
+
+      // Perform actual migration by writing each record via write envelope
+      for (const rec of legacyRecords) {
+        try {
+          const payload = {
+            id: rec.inquiryId,
+            contact: {
+              name: rec.customerName,
+              phone: rec.phoneNumber
+            },
+            source: rec.sourceCampaign,
+            text: rec.messageSummary,
+            assignee: rec.agentAssigned,
+            status: rec.status
+          };
+
+          const envelope = {
+            operation: 'write',
+            credential: writeSecret,
+            payload
+          };
+
+          const gsResponse = await fetch(appsScriptUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(envelope)
+          });
+
+          if (gsResponse.ok) {
+            const resJson = await gsResponse.json();
+            if (resJson.status === 'success' || resJson.status === 'updated') {
+              imported++;
+            } else {
+              skipped++;
+            }
+          } else {
+            failed++;
+          }
+        } catch (migErr) {
+          failed++;
+        }
+      }
+
+      return res.json({
+        success: true,
+        dryRun: false,
+        message: 'Legacy migration completed successfully. Original file left intact.',
+        stats: { imported, skipped, failed }
+      });
+    } catch (err: any) {
+      console.error('Migration error:', err);
+      return res.status(500).json({ success: false, error: err.toString() });
+    }
+  });
+
+  // Authenticated Simulator Endpoint
   app.post('/api/simulator/send', staffAuth, (req, res) => {
     try {
       const payload = req.body;
@@ -317,13 +419,24 @@ async function startServer() {
       const phoneNumber = rawPhone.replace(/[^0-9+]/g, '');
 
       if (!phoneNumber) {
-        return res.status(400).json({ status: 'error', message: 'Validation error: Missing required phone number.' });
+        return res.status(400).json({ status: 'error', code: 'INVALID_INPUT', message: 'Validation error: Missing required phone number.' });
       }
 
       const sourceCampaign = String(payload.source || payload.utm_campaign || payload.campaign_name || 'Organic / Direct');
-      const messageSummary = String(payload.text || payload.message || payload.body || payload.content || '');
-      const agentAssigned = String(payload.assignee || payload.agent?.name || 'Unassigned');
-      const status = String(payload.status || 'New') as any;
+      
+      const hasMessage = payload.text !== undefined || payload.message !== undefined || payload.body !== undefined || payload.content !== undefined;
+      const messageSummary = hasMessage ? String(payload.text || payload.message || payload.body || payload.content || '') : null;
+
+      const hasAgent = payload.assignee !== undefined || payload.agent?.name !== undefined;
+      const agentAssigned = hasAgent ? String(payload.assignee || payload.agent?.name || 'Unassigned') : null;
+
+      let status = payload.status !== undefined ? String(payload.status) : null;
+      const supportedStatuses = ['New', 'In Progress', 'Qualified', 'Closed', 'Lost'];
+      if (status !== null) {
+        if (!supportedStatuses.includes(status)) {
+          return res.status(400).json({ status: 'error', code: 'INVALID_STATUS', message: 'Unsupported status value.' });
+        }
+      }
 
       const existingIndex = demoInquiries.findIndex(
         item => item.date === dateStr && item.phoneNumber === phoneNumber
@@ -334,9 +447,9 @@ async function startServer() {
         demoInquiries[existingIndex] = {
           ...existing,
           timestamp: timestampStr,
-          messageSummary: messageSummary || existing.messageSummary,
-          agentAssigned: agentAssigned !== 'Unassigned' ? agentAssigned : existing.agentAssigned,
-          status: status !== 'New' ? status : existing.status
+          messageSummary: messageSummary !== null ? messageSummary : existing.messageSummary,
+          agentAssigned: agentAssigned !== null ? agentAssigned : existing.agentAssigned,
+          status: status !== null ? (status as InquiryRecord['status']) : existing.status
         };
         return res.json({
           status: 'updated',
@@ -353,9 +466,9 @@ async function startServer() {
         customerName,
         phoneNumber,
         sourceCampaign,
-        messageSummary,
-        agentAssigned,
-        status
+        messageSummary: messageSummary !== null ? messageSummary : '',
+        agentAssigned: agentAssigned !== null ? agentAssigned : 'Unassigned',
+        status: status !== null ? (status as InquiryRecord['status']) : 'New'
       };
 
       demoInquiries.unshift(newRecord);
@@ -368,7 +481,7 @@ async function startServer() {
       });
     } catch (err: any) {
       console.error('Simulator webhook error:', err);
-      return res.status(500).json({ status: 'error', message: err.toString() });
+      return res.status(500).json({ status: 'error', code: 'SERVER_ERROR', message: err.toString() });
     }
   });
 

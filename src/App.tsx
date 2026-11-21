@@ -30,7 +30,8 @@ import {
   Zap,
   HelpCircle,
   ArrowUpRight,
-  AlertCircle
+  AlertCircle,
+  DatabaseBackup
 } from 'lucide-react';
 
 interface InquiryRecord {
@@ -113,6 +114,10 @@ export default function App() {
   const [gasDeduplicate, setGasDeduplicate] = useState(true);
   const [copiedCode, setCopiedCode] = useState(false);
 
+  // Migration State
+  const [migrationResult, setMigrationResult] = useState<any>(null);
+  const [isMigrating, setIsMigrating] = useState(false);
+
   // AI Assistant State
   const [aiPlatformName, setAiPlatformName] = useState('Custom WhatsApp CRM');
   const [aiSamplePayload, setAiSamplePayload] = useState('{\n  "event": "message.received",\n  "contact": {\n    "full_name": "Jane Doe",\n    "phone": "+60129876543"\n  },\n  "message_body": "Hello world"\n}');
@@ -163,7 +168,7 @@ export default function App() {
       if (data.success) {
         setInquiries(data.data || []);
       } else {
-        setErrorMsg(data.error || 'Failed to authenticate or load leads.');
+        setErrorMsg(data.error || 'Failed to authenticate or load leads from Google Sheet.');
         setInquiries([]);
       }
     } catch (err: any) {
@@ -202,6 +207,30 @@ export default function App() {
     }
   };
 
+  const handleRunMigration = async (dryRun: boolean) => {
+    try {
+      setIsMigrating(true);
+      setMigrationResult(null);
+      const res = await fetch('/api/admin/migrate-legacy', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-staff-token': staffToken
+        },
+        body: JSON.stringify({ dryRun })
+      });
+      const data = await res.json();
+      setMigrationResult(data);
+      if (!dryRun && data.success) {
+        await fetchInquiries();
+      }
+    } catch (err: any) {
+      setMigrationResult({ success: false, error: err.toString() });
+    } finally {
+      setIsMigrating(false);
+    }
+  };
+
   const handleSendSimulatorWebhook = async () => {
     try {
       setIsSendingWebhook(true);
@@ -222,7 +251,7 @@ export default function App() {
         await fetchInquiries();
       }
     } catch (err: any) {
-      setWebhookResponse({ status: 'error', message: err.toString() });
+      setWebhookResponse({ status: 'error', code: 'SIMULATOR_ERROR', message: err.toString() });
     } finally {
       setIsSendingWebhook(false);
     }
@@ -292,7 +321,7 @@ export default function App() {
 
   const generatedGasCode = `/**
  * Google Apps Script Maintained Receiver & Source of Truth for WhatsApp Inquiries
- * Supports doPost(e) for webhooks and doGet(e) for dashboard reads.
+ * Handles secure JSON POST envelopes with operation ("read" or "write") and separate credentials.
  */
 
 const SPREADSHEET_ID = "${gasSpreadsheetId}";
@@ -300,61 +329,73 @@ const SHEET_NAME = "${gasSheetName}";
 const DEDUPLICATE_SAME_DAY = ${gasDeduplicate};
 const SUPPORTED_STATUSES = ["New", "In Progress", "Qualified", "Closed", "Lost"];
 
-function doGet(e) {
+function doPost(e) {
   try {
-    const expectedSecret = PropertiesService.getScriptProperties().getProperty("WHATSAPP_WEBHOOK_SECRET");
-    const providedSecret = e && e.parameter && e.parameter.secret;
-
-    if (!expectedSecret || providedSecret !== expectedSecret) {
-      return createJsonResponse({ status: "error", message: "Unauthorized." });
+    const rawData = e.postData.contents;
+    const envelope = JSON.parse(rawData);
+    
+    const operation = envelope.operation;
+    const credential = envelope.credential;
+    
+    const scriptProps = PropertiesService.getScriptProperties();
+    const readSecret = scriptProps.getProperty("APPS_SCRIPT_READ_SECRET");
+    const writeSecret = scriptProps.getProperty("APPS_SCRIPT_WRITE_SECRET");
+    const fallbackSecret = scriptProps.getProperty("WHATSAPP_WEBHOOK_SECRET");
+    
+    if (operation === "read") {
+      if (!readSecret && !fallbackSecret || (credential !== readSecret && credential !== fallbackSecret)) {
+        return createJsonResponse({ status: "error", code: "UNAUTHORIZED", message: "Unauthorized read credential." });
+      }
+      return handleRead();
+    } else if (operation === "write") {
+      if (!writeSecret && !fallbackSecret || (credential !== writeSecret && credential !== fallbackSecret)) {
+        return createJsonResponse({ status: "error", code: "UNAUTHORIZED", message: "Unauthorized write credential." });
+      }
+      return handleWrite(envelope.payload);
+    } else {
+      return createJsonResponse({ status: "error", code: "INVALID_OPERATION", message: "Unknown operation." });
     }
-
-    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const sheet = ss.getSheetByName(SHEET_NAME);
-    if (!sheet) {
-      return createJsonResponse({ status: "success", data: [] });
-    }
-
-    const data = sheet.getDataRange().getValues();
-    if (data.length <= 1) {
-      return createJsonResponse({ status: "success", data: [] });
-    }
-
-    const rows = [];
-    for (let i = 1; i < data.length; i++) {
-      const row = data[i];
-      if (!row[0] && !row[4]) continue; // skip empty rows
-      rows.push({
-        date: String(row[0] instanceof Date ? Utilities.formatDate(row[0], "Asia/Kuala_Lumpur", "yyyy-MM-dd") : row[0]),
-        timestamp: String(row[1] || ""),
-        inquiryId: String(row[2] || "").replace(/^'/, ""),
-        customerName: String(row[3] || "").replace(/^'/, ""),
-        phoneNumber: String(row[4] || "").replace(/^'/, ""),
-        sourceCampaign: String(row[5] || "").replace(/^'/, ""),
-        messageSummary: String(row[6] || "").replace(/^'/, ""),
-        agentAssigned: String(row[7] || "").replace(/^'/, ""),
-        status: String(row[8] || "New")
-      });
-    }
-
-    return createJsonResponse({ status: "success", data: rows.reverse() });
   } catch (err) {
-    return createJsonResponse({ status: "error", message: err.toString() });
+    return createJsonResponse({ status: "error", code: "SERVER_ERROR", message: err.toString() });
   }
 }
 
-function doPost(e) {
-  const expectedSecret = PropertiesService.getScriptProperties().getProperty("WHATSAPP_WEBHOOK_SECRET");
-  const providedSecret = (e && e.parameter && e.parameter.secret) || 
-                         (e && e.headers && (e.headers["X-Webhook-Secret"] || e.headers["x-webhook-secret"]));
-  
-  if (!expectedSecret || providedSecret !== expectedSecret) {
-    return createJsonResponse({ status: "error", message: "Unauthorized: Invalid or missing webhook secret." });
+function handleRead() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    return createJsonResponse({ status: "error", code: "SHEET_NOT_FOUND", message: "Raw_Inquiries sheet not found." });
   }
 
+  const data = sheet.getDataRange().getValues();
+  if (data.length <= 1) {
+    return createJsonResponse({ status: "success", data: [] });
+  }
+
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (!row[0] && !row[4]) continue;
+    rows.push({
+      date: String(row[0] instanceof Date ? Utilities.formatDate(row[0], "Asia/Kuala_Lumpur", "yyyy-MM-dd") : row[0]),
+      timestamp: String(row[1] || ""),
+      inquiryId: String(row[2] || "").replace(/^'/, ""),
+      customerName: String(row[3] || "").replace(/^'/, ""),
+      phoneNumber: String(row[4] || "").replace(/^'/, ""),
+      sourceCampaign: String(row[5] || "").replace(/^'/, ""),
+      messageSummary: String(row[6] || "").replace(/^'/, ""),
+      agentAssigned: String(row[7] || "").replace(/^'/, ""),
+      status: String(row[8] || "New")
+    });
+  }
+
+  return createJsonResponse({ status: "success", data: rows.reverse() });
+}
+
+function handleWrite(payload) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) {
-    return createJsonResponse({ status: "busy", message: "Server busy. Try again later." });
+    return createJsonResponse({ status: "busy", code: "BUSY", message: "Server busy. Try again later." });
   }
 
   try {
@@ -362,11 +403,8 @@ function doPost(e) {
     const sheet = ss.getSheetByName(SHEET_NAME);
     
     if (!sheet) {
-      return createJsonResponse({ status: "error", message: "Sheet '" + SHEET_NAME + "' not found." });
+      return createJsonResponse({ status: "error", code: "SHEET_NOT_FOUND", message: "Raw_Inquiries sheet not found." });
     }
-
-    const rawData = e.postData.contents;
-    const payload = JSON.parse(rawData);
 
     const now = new Date();
     const timezone = "Asia/Kuala_Lumpur";
@@ -379,21 +417,22 @@ function doPost(e) {
     const phoneNumber = rawPhone.replace(/[^0-9+]/g, "");
     
     if (!phoneNumber) {
-      return createJsonResponse({ status: "error", message: "Validation error: Missing required phone number." });
+      return createJsonResponse({ status: "error", code: "INVALID_INPUT", message: "Validation error: Missing required phone number." });
     }
 
     const sourceCampaign = String(payload.source || payload.utm_campaign || payload.campaign_name || "Organic / Direct");
-    const messageSummary = payload.text !== undefined || payload.message !== undefined || payload.body !== undefined || payload.content !== undefined
-      ? String(payload.text || payload.message || payload.body || payload.content || "")
-      : null; // omitted check
-      
-    const agentAssigned = payload.assignee !== undefined || payload.agent?.name !== undefined
-      ? String(payload.assignee || payload.agent?.name || "Unassigned")
-      : null; // omitted check
+    
+    const hasMessage = payload.text !== undefined || payload.message !== undefined || payload.body !== undefined || payload.content !== undefined;
+    const messageSummary = hasMessage ? String(payload.text || payload.message || payload.body || payload.content || "") : null;
+
+    const hasAgent = payload.assignee !== undefined || payload.agent?.name !== undefined;
+    const agentAssigned = hasAgent ? String(payload.assignee || payload.agent?.name || "Unassigned") : null;
 
     let status = payload.status !== undefined ? String(payload.status) : null;
-    if (status && !SUPPORTED_STATUSES.includes(status)) {
-      status = "New"; // fallback or validate
+    if (status !== null) {
+      if (!SUPPORTED_STATUSES.includes(status)) {
+        return createJsonResponse({ status: "error", code: "INVALID_STATUS", message: "Unsupported status value." });
+      }
     }
 
     const safeText = function(val) {
@@ -413,13 +452,12 @@ function doPost(e) {
         const existingStatus = sheet.getRange(existingRowIndex, 9).getValue();
         
         sheet.getRange(existingRowIndex, 2).setValue(timestampStr);
-        // Preserve earlier message and agent if omitted in follow-up update
         sheet.getRange(existingRowIndex, 7).setValue(messageSummary !== null ? safeText(messageSummary) : existingMessage);
         sheet.getRange(existingRowIndex, 8).setValue(agentAssigned !== null ? safeText(agentAssigned) : existingAgent);
         sheet.getRange(existingRowIndex, 9).setValue(status !== null ? safeText(status) : existingStatus);
         
         SpreadsheetApp.flush();
-        return createJsonResponse({ status: "updated", row: existingRowIndex });
+        return createJsonResponse({ status: "updated", action: "updated", row: existingRowIndex });
       }
     }
 
@@ -430,16 +468,16 @@ function doPost(e) {
       safeText(customerName),
       safeText(phoneNumber),
       safeText(sourceCampaign),
-      safeText(messageSummary || ""),
-      safeText(agentAssigned || "Unassigned"),
-      safeText(status || "New")
+      safeText(messageSummary !== null ? messageSummary : ""),
+      safeText(agentAssigned !== null ? agentAssigned : "Unassigned"),
+      safeText(status !== null ? status : "New")
     ]);
 
     SpreadsheetApp.flush();
     return createJsonResponse({ status: "success", action: "appended" });
 
   } catch (error) {
-    return createJsonResponse({ status: "error", message: error.toString() });
+    return createJsonResponse({ status: "error", code: "WRITE_ERROR", message: error.toString() });
   } finally {
     lock.releaseLock();
   }
@@ -607,14 +645,15 @@ function createJsonResponse(obj) {
             <div className="flex items-center space-x-2">
               <AlertCircle className="w-5 h-5 text-red-400 shrink-0" />
               <div>
-                <strong>Dashboard Load Error:</strong> {errorMsg}
+                <strong>Dashboard Read Error:</strong> {errorMsg}
               </div>
             </div>
             <button
               onClick={fetchInquiries}
-              className="bg-red-600 hover:bg-red-500 text-white px-3 py-1.5 rounded text-xs font-medium transition"
+              className="bg-red-600 hover:bg-red-500 text-white px-3.5 py-1.5 rounded text-xs font-semibold transition flex items-center space-x-1.5"
             >
-              Retry
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Retry Read</span>
             </button>
           </div>
         )}
@@ -659,7 +698,7 @@ function createJsonResponse(obj) {
                   </div>
                 </div>
 
-                {/* KPI Cards */}
+                {/* KPI Cards (Hidden / shown as — if errorMsg is present) */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                   <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm hover:border-slate-700 transition">
                     <div className="flex items-center justify-between">
@@ -669,7 +708,9 @@ function createJsonResponse(obj) {
                       </div>
                     </div>
                     <div className="mt-3 flex items-baseline">
-                      <span className="text-3xl font-extrabold text-white">{totalInquiriesCount}</span>
+                      <span className="text-3xl font-extrabold text-white">
+                        {errorMsg ? '—' : totalInquiriesCount}
+                      </span>
                       <span className="ml-2 text-xs text-slate-400">leads saved</span>
                     </div>
                     <p className="mt-1 text-xs text-slate-400">Raw_Inquiries tab</p>
@@ -683,7 +724,9 @@ function createJsonResponse(obj) {
                       </div>
                     </div>
                     <div className="mt-3 flex items-baseline">
-                      <span className="text-3xl font-extrabold text-white">{uniqueLeadsCount}</span>
+                      <span className="text-3xl font-extrabold text-white">
+                        {errorMsg ? '—' : uniqueLeadsCount}
+                      </span>
                       <span className="ml-2 text-xs text-blue-400 font-medium">Distinct phone #</span>
                     </div>
                     <p className="mt-1 text-xs text-slate-400">Deduplicated same-day</p>
@@ -697,7 +740,9 @@ function createJsonResponse(obj) {
                       </div>
                     </div>
                     <div className="mt-3 flex items-baseline">
-                      <span className="text-3xl font-extrabold text-white">{closedCount}</span>
+                      <span className="text-3xl font-extrabold text-white">
+                        {errorMsg ? '—' : closedCount}
+                      </span>
                       <span className="ml-2 text-xs text-purple-400 font-medium">Converted</span>
                     </div>
                     <p className="mt-1 text-xs text-slate-400">Daily_Summary rollup</p>
@@ -711,7 +756,9 @@ function createJsonResponse(obj) {
                       </div>
                     </div>
                     <div className="mt-3 flex items-baseline">
-                      <span className="text-3xl font-extrabold text-white">{conversionRate}%</span>
+                      <span className="text-3xl font-extrabold text-white">
+                        {errorMsg ? '—' : `${conversionRate}%`}
+                      </span>
                       <span className="ml-2 text-xs text-amber-400 font-medium">Target: 25%</span>
                     </div>
                     <p className="mt-1 text-xs text-slate-400">Live formula ratio</p>
@@ -746,33 +793,47 @@ function createJsonResponse(obj) {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/60">
-                        {inquiries.slice(0, 5).map((item, idx) => (
-                          <tr key={idx} className="hover:bg-slate-800/30 transition">
-                            <td className="py-3 pr-3">
-                              <div className="font-medium text-white">{item.customerName}</div>
-                              <div className="text-xs text-slate-400 font-mono">{item.phoneNumber}</div>
-                            </td>
-                            <td className="py-3 pr-3">
-                              <span className="inline-block px-2 py-0.5 rounded text-xs bg-slate-800 text-slate-300 font-mono">
-                                {item.sourceCampaign}
-                              </span>
-                            </td>
-                            <td className="py-3 pr-3 text-slate-300 text-xs">{item.agentAssigned}</td>
-                            <td className="py-3 pr-3">
-                              <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
-                                item.status === 'Closed' ? 'bg-purple-500/10 text-purple-400 border border-purple-500/20' :
-                                item.status === 'Qualified' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
-                                item.status === 'In Progress' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
-                                'bg-slate-800 text-slate-300'
-                              }`}>
-                                {item.status}
-                              </span>
-                            </td>
-                            <td className="py-3 text-right text-xs text-slate-400 font-mono">
-                              {item.timestamp}
+                        {errorMsg ? (
+                          <tr>
+                            <td colSpan={5} className="text-center py-12 text-red-400">
+                              Unable to load recent inquiries due to storage read error.
                             </td>
                           </tr>
-                        ))}
+                        ) : inquiries.length === 0 ? (
+                          <tr>
+                            <td colSpan={5} className="text-center py-12 text-slate-500">
+                              0 inquiries found. (Sheet read successfully).
+                            </td>
+                          </tr>
+                        ) : (
+                          inquiries.slice(0, 5).map((item, idx) => (
+                            <tr key={idx} className="hover:bg-slate-800/30 transition">
+                              <td className="py-3 pr-3">
+                                <div className="font-medium text-white">{item.customerName}</div>
+                                <div className="text-xs text-slate-400 font-mono">{item.phoneNumber}</div>
+                              </td>
+                              <td className="py-3 pr-3">
+                                <span className="inline-block px-2 py-0.5 rounded text-xs bg-slate-800 text-slate-300 font-mono">
+                                  {item.sourceCampaign}
+                                </span>
+                              </td>
+                              <td className="py-3 pr-3 text-slate-300 text-xs">{item.agentAssigned}</td>
+                              <td className="py-3 pr-3">
+                                <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                                  item.status === 'Closed' ? 'bg-purple-500/10 text-purple-400 border border-purple-500/20' :
+                                  item.status === 'Qualified' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
+                                  item.status === 'In Progress' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
+                                  'bg-slate-800 text-slate-300'
+                                }`}>
+                                  {item.status}
+                                </span>
+                              </td>
+                              <td className="py-3 text-right text-xs text-slate-400 font-mono">
+                                {item.timestamp}
+                              </td>
+                            </tr>
+                          ))
+                        )}
                       </tbody>
                     </table>
                   </div>
@@ -883,10 +944,16 @@ function createJsonResponse(obj) {
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800/60 font-sans text-sm">
-                          {filteredInquiries.length === 0 ? (
+                          {errorMsg ? (
+                            <tr>
+                              <td colSpan={9} className="text-center py-12 text-red-400">
+                                Storage read error: {errorMsg}
+                              </td>
+                            </tr>
+                          ) : filteredInquiries.length === 0 ? (
                             <tr>
                               <td colSpan={9} className="text-center py-12 text-slate-500">
-                                No leads found. (0 leads in sheet).
+                                0 inquiries found. (Sheet read successfully).
                               </td>
                             </tr>
                           ) : (
@@ -948,7 +1015,13 @@ function createJsonResponse(obj) {
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800/60 font-sans">
-                          {dailySummaries.length === 0 ? (
+                          {errorMsg ? (
+                            <tr>
+                              <td colSpan={6} className="text-center py-12 text-red-400">
+                                Summary unavailable due to storage read error.
+                              </td>
+                            </tr>
+                          ) : dailySummaries.length === 0 ? (
                             <tr>
                               <td colSpan={6} className="text-center py-12 text-slate-500">
                                 No summary data available yet.
@@ -1020,7 +1093,7 @@ function createJsonResponse(obj) {
 
                     <div className="space-y-2">
                       <label className="text-xs font-medium text-slate-300 uppercase tracking-wider">
-                        JSON Payload Editor (Supports Respond.io & SleekFlow formats)
+                        JSON Payload Editor (Supports status-only updates & literal text preservation)
                       </label>
                       <textarea
                         rows={10}
@@ -1067,8 +1140,8 @@ function createJsonResponse(obj) {
                             }`}>
                               Status: {webhookResponse.status}
                             </span>
-                            {webhookResponse.action && (
-                              <span className="text-xs font-mono text-slate-400">Action: {webhookResponse.action}</span>
+                            {webhookResponse.code && (
+                              <span className="text-xs font-mono text-slate-400">Code: {webhookResponse.code}</span>
                             )}
                           </div>
                           <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 overflow-x-auto">
@@ -1079,7 +1152,7 @@ function createJsonResponse(obj) {
                         </div>
                       ) : (
                         <div className="text-center py-12 text-slate-500 text-sm">
-                          Click "Simulate Webhook Delivery" to test payload parsing, strict phone validation, and deduplication.
+                          Click "Simulate Webhook Delivery" to test payload parsing, strict status validation, and field preservation.
                         </div>
                       )}
                     </div>
@@ -1090,7 +1163,7 @@ function createJsonResponse(obj) {
                         <span>Live Production Webhook Endpoint</span>
                       </h3>
                       <p className="text-xs text-slate-300 leading-relaxed">
-                        For live WhatsApp traffic, configure your CRM to call your Express backend webhook endpoint: <code className="text-emerald-400 font-mono">POST /api/webhook/whatsapp?secret=YOUR_WEBHOOK_SECRET</code> (or header <code className="text-emerald-400 font-mono">X-Webhook-Secret</code>). Express verifies the secret and forwards the lead to Google Sheets atomically.
+                        For live WhatsApp traffic, configure your CRM to call <code className="text-emerald-400 font-mono">POST /api/webhook/whatsapp</code> with header <code className="text-emerald-400 font-mono">X-Webhook-Secret: YOUR_WHATSAPP_WEBHOOK_SECRET</code>. URL query parameters are rejected.
                       </p>
                     </div>
                   </div>
@@ -1098,13 +1171,13 @@ function createJsonResponse(obj) {
               </div>
             )}
 
-            {/* 4. GOOGLE APPS SCRIPT GENERATOR TAB */}
+            {/* 4. GOOGLE APPS SCRIPT GENERATOR & MIGRATION TAB */}
             {activeTab === 'gas' && (
               <div className="space-y-6 animate-fadeIn">
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
                   <div>
-                    <h1 className="text-2xl font-bold text-white tracking-tight">Google Apps Script Generator</h1>
-                    <p className="text-sm text-slate-400">Maintained receiver supporting both <code className="text-emerald-400 font-mono">doPost(e)</code> and <code className="text-emerald-400 font-mono">doGet(e)</code></p>
+                    <h1 className="text-2xl font-bold text-white tracking-tight">Google Apps Script Generator & Migration</h1>
+                    <p className="text-sm text-slate-400">Maintained receiver supporting JSON POST envelopes (<code className="text-emerald-400 font-mono">read</code> & <code className="text-emerald-400 font-mono">write</code>)</p>
                   </div>
 
                   <button
@@ -1161,11 +1234,52 @@ function createJsonResponse(obj) {
                   </div>
                 </div>
 
+                {/* Migration Section */}
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h2 className="text-base font-bold text-white flex items-center space-x-2">
+                        <DatabaseBackup className="w-4 h-4 text-teal-400" />
+                        <span>Legacy Live Records Migration Tool</span>
+                      </h2>
+                      <p className="text-xs text-slate-400">Safely migrate earlier records from private <code className="text-emerald-400 font-mono">data/live_inquiries.json</code> into Google Sheets</p>
+                    </div>
+                    <div className="flex space-x-2">
+                      <button
+                        onClick={() => handleRunMigration(true)}
+                        disabled={isMigrating}
+                        className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-xs font-semibold transition"
+                      >
+                        Run Migration Dry Run
+                      </button>
+                      <button
+                        onClick={() => {
+                          if (confirm('Execute live migration into Google Sheets?')) {
+                            handleRunMigration(false);
+                          }
+                        }}
+                        disabled={isMigrating}
+                        className="bg-teal-600 hover:bg-teal-500 text-white px-3 py-2 rounded-lg text-xs font-semibold transition"
+                      >
+                        Execute Live Migration
+                      </button>
+                    </div>
+                  </div>
+
+                  {migrationResult && (
+                    <div className="bg-slate-950 border border-slate-800 rounded-lg p-3">
+                      <pre className="text-xs font-mono text-teal-300">
+                        {JSON.stringify(migrationResult, null, 2)}
+                      </pre>
+                    </div>
+                  )}
+                </div>
+
                 {/* Code Preview Box */}
                 <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-sm">
                   <div className="p-4 border-b border-slate-800 flex items-center justify-between">
-                    <span className="text-xs font-mono text-slate-400">Code.gs (Google Apps Script - Maintained Source of Truth)</span>
-                    <span className="text-xs text-emerald-400 font-mono">doGet + doPost + Text Safety + Locking</span>
+                    <span className="text-xs font-mono text-slate-400">Code.gs (Google Apps Script - JSON POST Envelope Receiver)</span>
+                    <span className="text-xs text-emerald-400 font-mono">Operation Verification + Text Safety</span>
                   </div>
                   <div className="p-4 bg-slate-950 overflow-x-auto max-h-96">
                     <pre className="text-xs font-mono text-emerald-300 leading-relaxed">
@@ -1181,11 +1295,11 @@ function createJsonResponse(obj) {
                     <span>Accurate Setup & Deployment Guide</span>
                   </h3>
                   <ol className="list-decimal list-inside space-y-2 text-xs text-slate-300">
-                    <li>Create a Google Sheet with tabs <strong className="text-white">Raw_Inquiries</strong> and <strong className="text-white">Daily_Summary</strong>. Copy your Spreadsheet ID from the URL.</li>
-                    <li>Open <strong className="text-white">Extensions &gt; Apps Script</strong>, paste the code above into <code className="text-emerald-400 font-mono">Code.gs</code>.</li>
-                    <li>Go to <strong className="text-white">Project Settings (Gear icon) &gt; Script Properties</strong>, add property <code className="text-emerald-400 font-mono">WHATSAPP_WEBHOOK_SECRET</code> with your secret token.</li>
+                    <li>Create a Google Sheet with tabs <strong className="text-white">Raw_Inquiries</strong> and <strong className="text-white">Daily_Summary</strong>. Copy your Spreadsheet ID.</li>
+                    <li>Open <strong className="text-white">Extensions &gt; Apps Script</strong>, paste the maintained receiver code above into <code className="text-emerald-400 font-mono">Code.gs</code>.</li>
+                    <li>Go to <strong className="text-white">Project Settings (Gear icon) &gt; Script Properties</strong>, add properties <code className="text-emerald-400 font-mono">APPS_SCRIPT_READ_SECRET</code>, <code className="text-emerald-400 font-mono">APPS_SCRIPT_WRITE_SECRET</code>, and <code className="text-emerald-400 font-mono">WHATSAPP_WEBHOOK_SECRET</code>.</li>
                     <li>Click <strong className="text-white">Deploy &gt; New deployment</strong> &gt; Web app (Execute as: <strong className="text-white">Me</strong>, Who has access: <strong className="text-white">Anyone</strong>). Copy the Web App URL into <code className="text-emerald-400 font-mono">APPS_SCRIPT_WEB_APP_URL</code> in your server environment.</li>
-                    <li>Configure your WhatsApp CRM to send webhooks to your Express backend (<code className="text-emerald-400 font-mono">POST /api/webhook/whatsapp?secret=...</code>). The lead is saved in Google Sheets and immediately appears in the Live Dashboard.</li>
+                    <li>Configure your WhatsApp CRM webhook to send to your Express backend (<code className="text-emerald-400 font-mono">POST /api/webhook/whatsapp</code>) with header <code className="text-emerald-400 font-mono">X-Webhook-Secret: YOUR_SECRET</code>.</li>
                   </ol>
                 </div>
               </div>
@@ -1289,28 +1403,28 @@ function createJsonResponse(obj) {
                     <p className="text-sm text-slate-400">Complete architectural specification and workflow guide</p>
                   </div>
                   <a
-                    href="/public/assets/aistudio/whatsapp_inquiry_to_google_sheets_automation_blueprint_8d9b025b.md"
+                    href="/assets/aistudio/whatsapp_inquiry_to_google_sheets_automation_blueprint_8d9b025b.md"
                     target="_blank"
                     rel="noreferrer"
                     className="inline-flex items-center space-x-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 px-3.5 py-2 rounded-lg text-sm font-medium transition"
                   >
-                    <span>Open Raw Markdown Guide</span>
-                    <ExternalLink className="w-4 h-4" />
+                    <span>Download Production Blueprint</span>
+                    <Download className="w-4 h-4" />
                   </a>
                 </div>
 
                 <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 sm:p-8 space-y-6 text-slate-300 leading-relaxed text-sm">
                   <div className="border-b border-slate-800 pb-4">
-                    <h2 className="text-xl font-bold text-white mb-2">1. Google Sheets as Source of Truth</h2>
+                    <h2 className="text-xl font-bold text-white mb-2">1. Separate CRM Write Access from Dashboard Read Access</h2>
                     <p className="text-slate-400">
-                      Live leads are read directly from and written directly to Google Sheets via Apps Script Web App (`doGet` & `doPost`). Express validates webhooks against `WHATSAPP_WEBHOOK_SECRET` and returns success only after Google Sheets confirms the write.
+                      CRM webhooks arrive at <code className="text-emerald-400 font-mono">POST /api/webhook/whatsapp</code> authenticated via header <code className="text-emerald-400 font-mono">X-Webhook-Secret</code>. Dashboard reads arrive at Express and query Google Sheets using a secure JSON POST envelope ({`{ operation: "read", credential: ... }`}) sent to Apps Script. The CRM credential can never read records.
                     </p>
                   </div>
 
                   <div className="border-b border-slate-800 pb-4">
-                    <h2 className="text-xl font-bold text-white mb-2">2. Concurrency & Update Preservation</h2>
+                    <h2 className="text-xl font-bold text-white mb-2">2. Status-Only Updates & Field Preservation</h2>
                     <p className="text-slate-400">
-                      Apps Script uses `LockService.tryLock(10000)` and `SpreadsheetApp.flush()`. Status-only updates preserve earlier messages and assigned agents. Formulas starting with `=` and phone numbers starting with `+` or leading zeros are wrapped safely as literal text.
+                      Follow-up updates that only supply status leave earlier message and agent cells untouched. Incoming text and phone numbers are written as literal text (preventing formula injection for messages starting with `=`).
                     </p>
                   </div>
 
