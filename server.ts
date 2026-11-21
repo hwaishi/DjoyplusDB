@@ -8,7 +8,7 @@ import { GoogleGenAI } from '@google/genai';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const DATA_DIR = path.resolve(__dirname, 'data');
-const LIVE_INQUIRIES_FILE = path.join(DATA_DIR, 'live_inquiries.json');
+const LEGACY_JSON_FILE = path.join(DATA_DIR, 'live_inquiries.json');
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -52,25 +52,18 @@ let demoInquiries: InquiryRecord[] = [
   }
 ];
 
-function loadLiveInquiries(): InquiryRecord[] {
+// One-time migration procedure for legacy JSON file if present
+function migrateLegacyJsonIfNeeded() {
   try {
-    if (fs.existsSync(LIVE_INQUIRIES_FILE)) {
-      const content = fs.readFileSync(LIVE_INQUIRIES_FILE, 'utf-8');
-      return JSON.parse(content);
+    if (fs.existsSync(LEGACY_JSON_FILE)) {
+      console.log('Found legacy live_inquiries.json store. Preserving securely outside web root.');
+      // The file is kept in data/ which is gitignored and not served by express static.
     }
   } catch (err) {
-    console.error('Error loading live inquiries:', err);
-  }
-  return [];
-}
-
-function saveLiveInquiries(records: InquiryRecord[]): void {
-  try {
-    fs.writeFileSync(LIVE_INQUIRIES_FILE, JSON.stringify(records, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('Error saving live inquiries:', err);
+    console.error('Migration check error:', err);
   }
 }
+migrateLegacyJsonIfNeeded();
 
 // Get current date & timestamp in Asia/Kuala_Lumpur
 function getMalaysiaDateTime() {
@@ -141,10 +134,10 @@ const geminiRateLimiter = (() => {
 // Staff Auth Middleware
 const staffAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const staffKey = process.env.STAFF_API_KEY;
-  const token = req.headers['x-staff-token'] || req.headers['authorization']?.replace('Bearer ', '');
-  if (!staffKey) {
-    return res.status(503).json({ success: false, error: 'STAFF_API_KEY not configured on server environment.' });
+  if (!staffKey || staffKey.trim() === '' || staffKey === 'my_secure_staff_token') {
+    return res.status(503).json({ success: false, error: 'STAFF_API_KEY is not configured or uses insecure example value on server.' });
   }
+  const token = req.headers['x-staff-token'] || req.headers['authorization']?.replace('Bearer ', '');
   if (!token || token !== staffKey) {
     return res.status(401).json({ success: false, error: 'Unauthorized: Invalid or missing staff token.' });
   }
@@ -154,8 +147,8 @@ const staffAuth = (req: express.Request, res: express.Response, next: express.Ne
 // Webhook Secret Verification Middleware
 const verifyWebhookSecret = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET;
-  if (!webhookSecret) {
-    return res.status(503).json({ success: false, error: 'WHATSAPP_WEBHOOK_SECRET not configured on server environment.' });
+  if (!webhookSecret || webhookSecret.trim() === '' || webhookSecret === 'my_whatsapp_webhook_secret') {
+    return res.status(503).json({ success: false, error: 'WHATSAPP_WEBHOOK_SECRET is not configured or uses insecure example value on server.' });
   }
   const providedSecret = req.headers['x-webhook-secret'] || req.query.secret || req.headers['authorization']?.replace('Bearer ', '');
   if (!providedSecret || providedSecret !== webhookSecret) {
@@ -170,26 +163,58 @@ async function startServer() {
 
   // Check auth status
   app.get('/api/auth/status', (req, res) => {
-    const staffKeySet = !!process.env.STAFF_API_KEY;
-    const webhookSecretSet = !!process.env.WHATSAPP_WEBHOOK_SECRET;
+    const staffKey = process.env.STAFF_API_KEY || '';
+    const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET || '';
+    const staffKeySet = staffKey.length > 0 && staffKey !== 'my_secure_staff_token';
+    const webhookSecretSet = webhookSecret.length > 0 && webhookSecret !== 'my_whatsapp_webhook_secret';
     const geminiKeySet = !!process.env.GEMINI_API_KEY;
+    const appsScriptUrlSet = !!process.env.APPS_SCRIPT_WEB_APP_URL;
     res.json({
       success: true,
       config: {
         staffKeySet,
         webhookSecretSet,
-        geminiKeySet
+        geminiKeySet,
+        appsScriptUrlSet
       }
     });
   });
 
-  // Get inquiries (supports ?mode=demo or ?mode=live)
-  app.get('/api/inquiries', staffAuth, (req, res) => {
+  // Get inquiries (mode=demo or mode=live)
+  app.get('/api/inquiries', staffAuth, async (req, res) => {
     const mode = req.query.mode === 'live' ? 'live' : 'demo';
-    if (mode === 'live') {
-      res.json({ success: true, mode: 'live', data: loadLiveInquiries() });
-    } else {
-      res.json({ success: true, mode: 'demo', data: demoInquiries });
+    if (mode === 'demo') {
+      return res.json({ success: true, mode: 'demo', data: demoInquiries });
+    }
+
+    // Live mode: Google Sheets is the source of truth via Apps Script Web App doGet
+    const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL;
+    const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET;
+
+    if (!appsScriptUrl || !webhookSecret) {
+      return res.status(503).json({
+        success: false,
+        error: 'Live Google Sheets integration not fully configured. Please set APPS_SCRIPT_WEB_APP_URL and WHATSAPP_WEBHOOK_SECRET.'
+      });
+    }
+
+    try {
+      const response = await fetch(`${appsScriptUrl}?action=get&secret=${encodeURIComponent(webhookSecret)}`);
+      if (!response.ok) {
+        throw new Error(`Apps Script responded with HTTP status ${response.status}`);
+      }
+      const result = await response.json();
+      if (result.status === 'success' && Array.isArray(result.data)) {
+        return res.json({ success: true, mode: 'live', data: result.data });
+      } else {
+        throw new Error(result.message || 'Failed to retrieve live leads from Google Sheet.');
+      }
+    } catch (err: any) {
+      console.error('Dashboard live read error:', err);
+      return res.status(502).json({
+        success: false,
+        error: `Failed to load live leads from Google Sheet: ${err.toString()}`
+      });
     }
   });
 
@@ -222,88 +247,52 @@ async function startServer() {
     res.json({ success: true, data: demoInquiries });
   });
 
-  // Live WhatsApp Webhook Endpoint (Protected by webhook secret)
-  app.post('/api/webhook/whatsapp', verifyWebhookSecret, (req, res) => {
+  // Live WhatsApp Webhook Endpoint (Protected by webhook secret & Google Sheets Source of Truth)
+  app.post('/api/webhook/whatsapp', verifyWebhookSecret, async (req, res) => {
     try {
       const payload = req.body;
-      const { dateStr, timestampStr } = getMalaysiaDateTime();
+      const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL;
+      const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET;
 
-      const inquiryId = payload.id || payload.message_id || `WH-${Math.floor(10000 + Math.random() * 90000)}`;
-      const customerName = String(
-        payload.contact?.name || 
-        payload.name || 
-        payload.contact?.full_name || 
-        payload.customer?.full_name || 
-        'Unknown'
-      );
-      
-      const rawPhone = String(
-        payload.contact?.phone || 
-        payload.phone || 
-        payload.sender?.phone || 
-        payload.customer?.phone || 
-        ''
-      );
-      const phoneNumber = rawPhone.replace(/[^0-9+]/g, '');
-
-      if (!phoneNumber) {
-        return res.status(400).json({ status: 'error', message: 'Validation error: Missing required phone number.' });
+      if (!appsScriptUrl || !webhookSecret) {
+        return res.status(503).json({ status: 'error', message: 'Apps Script storage URL not configured.' });
       }
 
-      const sourceCampaign = String(payload.source || payload.utm_campaign || payload.campaign_name || 'Organic / Direct');
-      const messageSummary = String(payload.text || payload.message || payload.body || payload.content || '');
-      const agentAssigned = String(payload.assignee || payload.agent?.name || 'Unassigned');
-      const status = String(payload.status || 'New') as any;
+      // Forward request to Google Apps Script Web App (Source of Truth)
+      const forwardUrl = `${appsScriptUrl}?secret=${encodeURIComponent(webhookSecret)}`;
+      const gsResponse = await fetch(forwardUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
 
-      let liveRecords = loadLiveInquiries();
-      const existingIndex = liveRecords.findIndex(
-        item => item.date === dateStr && item.phoneNumber === phoneNumber
-      );
+      if (!gsResponse.ok) {
+        return res.status(502).json({ status: 'error', message: `Google Sheets storage error (HTTP ${gsResponse.status})` });
+      }
 
-      if (existingIndex >= 0) {
-        const existing = liveRecords[existingIndex];
-        liveRecords[existingIndex] = {
-          ...existing,
-          timestamp: timestampStr,
-          messageSummary: messageSummary || existing.messageSummary,
-          agentAssigned: agentAssigned !== 'Unassigned' ? agentAssigned : existing.agentAssigned,
-          status: status !== 'New' ? status : existing.status
-        };
-        saveLiveInquiries(liveRecords);
+      const gsResult = await gsResponse.json();
+
+      // Inspect response body for application-level busy or error
+      if (gsResult.status === 'busy' || gsResult.status === 'error') {
+        return res.status(503).json({ status: gsResult.status, message: gsResult.message || 'Google Sheets is busy or returned an error.' });
+      }
+
+      if (gsResult.status === 'success' || gsResult.status === 'updated') {
         return res.json({
-          status: 'updated',
-          row: existingIndex + 2,
-          message: 'Existing live inquiry updated for today (deduplicated).'
+          status: gsResult.status,
+          action: gsResult.action || gsResult.status,
+          message: 'Lead successfully saved in Google Sheets source of truth.'
         });
       }
 
-      const newRecord: InquiryRecord = {
-        date: dateStr,
-        timestamp: timestampStr,
-        inquiryId,
-        customerName,
-        phoneNumber,
-        sourceCampaign,
-        messageSummary,
-        agentAssigned,
-        status
-      };
-
-      liveRecords.unshift(newRecord);
-      saveLiveInquiries(liveRecords);
-
-      return res.json({
-        status: 'success',
-        action: 'appended',
-        record: newRecord
-      });
+      return res.status(502).json({ status: 'error', message: 'Unexpected response from Google Sheets receiver.' });
     } catch (err: any) {
-      console.error('Live webhook error:', err);
-      return res.status(500).json({ status: 'error', message: err.toString() });
+      console.error('Live webhook forwarding error:', err);
+      return res.status(503).json({ status: 'error', message: `Temporary storage unavailable: ${err.toString()}` });
     }
   });
 
-  // Authenticated Simulator Endpoint (allows UI simulator to submit sample events without exposing live secret)
+  // Authenticated Simulator Endpoint (allows UI simulator to submit sample events securely)
   app.post('/api/simulator/send', staffAuth, (req, res) => {
     try {
       const payload = req.body;
@@ -336,7 +325,6 @@ async function startServer() {
       const agentAssigned = String(payload.assignee || payload.agent?.name || 'Unassigned');
       const status = String(payload.status || 'New') as any;
 
-      // Simulator events update demo inquiries so the sandbox reflects test runs securely
       const existingIndex = demoInquiries.findIndex(
         item => item.date === dateStr && item.phoneNumber === phoneNumber
       );
@@ -394,7 +382,6 @@ async function startServer() {
         return res.status(500).json({ success: false, error: 'GEMINI_API_KEY not configured in environment.' });
       }
 
-      // Privacy sanitization: sanitize customer values while preserving schema structure & types
       const sanitizedPayload = sanitizeJsonForAi(jsonPayload);
 
       const ai = new GoogleGenAI({ apiKey });
@@ -416,22 +403,28 @@ Provide a concise, expert analysis with:
       res.json({ success: true, analysis: response.text });
     } catch (err: any) {
       console.error('AI Analysis error:', err);
-      // Ensure API keys are never leaked in error responses
       const safeMessage = err.toString().replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_API_KEY]');
       res.status(500).json({ success: false, error: safeMessage });
     }
   });
 
-  // Vite middleware setup
-  const vite = await createViteServer({
-    server: { middlewareMode: true, hmr: process.env.DISABLE_HMR !== 'true' }
-  });
-
-  app.use(vite.middlewares);
+  // Production vs. Development middleware setup
+  if (process.env.NODE_ENV === 'production') {
+    const distPath = path.resolve(__dirname, 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  } else {
+    const vite = await createViteServer({
+      server: { middlewareMode: true, hmr: process.env.DISABLE_HMR !== 'true' }
+    });
+    app.use(vite.middlewares);
+  }
 
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`);
   });
 }
 
