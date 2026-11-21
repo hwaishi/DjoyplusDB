@@ -52,6 +52,31 @@ let demoInquiries: InquiryRecord[] = [
   }
 ];
 
+// Startup credential validation (Fail Closed & Distinct Secrets)
+function validateServerCredentials() {
+  const staffKey = process.env.STAFF_API_KEY || '';
+  const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET || '';
+  const readSecret = process.env.APPS_SCRIPT_READ_SECRET || '';
+  const writeSecret = process.env.APPS_SCRIPT_WRITE_SECRET || '';
+
+  if (!staffKey || staffKey === 'my_secure_staff_token') {
+    console.warn('SECURITY WARNING: STAFF_API_KEY is not configured or uses default example value.');
+  }
+  if (!webhookSecret || webhookSecret === 'my_whatsapp_webhook_secret') {
+    console.warn('SECURITY WARNING: WHATSAPP_WEBHOOK_SECRET is not configured or uses default example value.');
+  }
+  if (!readSecret || !writeSecret) {
+    console.warn('SECURITY WARNING: APPS_SCRIPT_READ_SECRET or APPS_SCRIPT_WRITE_SECRET is missing.');
+  }
+  if (readSecret && writeSecret && readSecret === writeSecret) {
+    console.error('CRITICAL SECURITY ERROR: APPS_SCRIPT_READ_SECRET and APPS_SCRIPT_WRITE_SECRET must be distinct.');
+  }
+  if (webhookSecret && (webhookSecret === readSecret || webhookSecret === writeSecret)) {
+    console.error('CRITICAL SECURITY ERROR: WHATSAPP_WEBHOOK_SECRET must be distinct from Apps Script read/write secrets.');
+  }
+}
+validateServerCredentials();
+
 // Get current date & timestamp in Asia/Kuala_Lumpur
 function getMalaysiaDateTime() {
   const now = new Date();
@@ -135,7 +160,7 @@ const staffAuth = (req: express.Request, res: express.Response, next: express.Ne
 const verifyWebhookSecret = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET;
   if (!webhookSecret || webhookSecret.trim() === '' || webhookSecret === 'my_whatsapp_webhook_secret') {
-    return res.status(503).json({ status: 'error', code: 'CONFIG_ERROR', message: 'WHATSAPP_WEBHOOK_SECRET is not configured on server.' });
+    return res.status(403).json({ status: 'error', code: 'CONFIG_ERROR', message: 'Webhook secret not configured on server.' });
   }
   const providedSecret = req.headers['x-webhook-secret'] || req.headers['authorization']?.replace('Bearer ', '');
   if (!providedSecret || providedSecret !== webhookSecret) {
@@ -152,15 +177,23 @@ async function startServer() {
   app.get('/api/auth/status', (req, res) => {
     const staffKey = process.env.STAFF_API_KEY || '';
     const webhookSecret = process.env.WHATSAPP_WEBHOOK_SECRET || '';
+    const readSecret = process.env.APPS_SCRIPT_READ_SECRET || '';
+    const writeSecret = process.env.APPS_SCRIPT_WRITE_SECRET || '';
+
     const staffKeySet = staffKey.length > 0 && staffKey !== 'my_secure_staff_token';
     const webhookSecretSet = webhookSecret.length > 0 && webhookSecret !== 'my_whatsapp_webhook_secret';
+    const readSecretSet = readSecret.length > 0 && readSecret !== 'my_read_secret';
+    const writeSecretSet = writeSecret.length > 0 && writeSecret !== 'my_write_secret';
     const geminiKeySet = !!process.env.GEMINI_API_KEY;
     const appsScriptUrlSet = !!process.env.APPS_SCRIPT_WEB_APP_URL;
+
     res.json({
       success: true,
       config: {
         staffKeySet,
         webhookSecretSet,
+        readSecretSet,
+        writeSecretSet,
         geminiKeySet,
         appsScriptUrlSet
       }
@@ -174,14 +207,14 @@ async function startServer() {
       return res.json({ success: true, mode: 'demo', data: demoInquiries });
     }
 
-    // Live mode: Google Sheets is source of truth via Apps Script POST envelope (operation: "read")
+    // Live mode: Use ONLY APPS_SCRIPT_READ_SECRET for reads
     const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL;
-    const readSecret = process.env.APPS_SCRIPT_READ_SECRET || process.env.APPS_SCRIPT_SECRET || process.env.WHATSAPP_WEBHOOK_SECRET;
+    const readSecret = process.env.APPS_SCRIPT_READ_SECRET;
 
-    if (!appsScriptUrl || !readSecret) {
+    if (!appsScriptUrl || !readSecret || readSecret.trim() === '') {
       return res.status(503).json({
         success: false,
-        error: 'Live Google Sheets integration not fully configured. Please set APPS_SCRIPT_WEB_APP_URL and APPS_SCRIPT_READ_SECRET.'
+        error: 'Live Google Sheets read access not configured. Please set APPS_SCRIPT_WEB_APP_URL and APPS_SCRIPT_READ_SECRET.'
       });
     }
 
@@ -249,13 +282,13 @@ async function startServer() {
     try {
       const payload = req.body;
       const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL;
-      const writeSecret = process.env.APPS_SCRIPT_WRITE_SECRET || process.env.APPS_SCRIPT_SECRET || process.env.WHATSAPP_WEBHOOK_SECRET;
+      const writeSecret = process.env.APPS_SCRIPT_WRITE_SECRET;
 
-      if (!appsScriptUrl || !writeSecret) {
-        return res.status(503).json({ status: 'error', code: 'CONFIG_ERROR', message: 'Apps Script storage URL or write credential not configured.' });
+      if (!appsScriptUrl || !writeSecret || writeSecret.trim() === '') {
+        return res.status(503).json({ status: 'error', code: 'CONFIG_ERROR', message: 'Apps Script write access not configured on server.' });
       }
 
-      // Construct JSON POST envelope with operation "write"
+      // Construct JSON POST envelope with operation "write" using ONLY writeSecret
       const envelope = {
         operation: 'write',
         credential: writeSecret,
@@ -274,7 +307,12 @@ async function startServer() {
 
       const gsResult = await gsResponse.json();
 
-      // Return right error to CRM based on Apps Script stable machine-readable codes
+      // Distinguish CRM auth failure / backend configuration failure
+      if (gsResult.status === 'error' && gsResult.code === 'UNAUTHORIZED') {
+        // Express authenticated CRM successfully, but Apps Script rejected Express's internal writeSecret
+        return res.status(503).json({ status: 'error', code: 'BACKEND_CONFIG_ERROR', message: 'Backend configuration error: Internal Apps Script write credential rejected.' });
+      }
+
       if (gsResult.status === 'busy' || gsResult.code === 'BUSY') {
         return res.status(503).json({ status: 'busy', code: 'BUSY', message: gsResult.message || 'Google Sheets is busy (lock contention).' });
       }
@@ -283,9 +321,6 @@ async function startServer() {
         const code = gsResult.code || 'STORAGE_ERROR';
         if (code === 'INVALID_INPUT' || code === 'INVALID_STATUS') {
           return res.status(400).json({ status: 'error', code, message: gsResult.message || 'Invalid input or unsupported status.' });
-        }
-        if (code === 'UNAUTHORIZED') {
-          return res.status(401).json({ status: 'error', code, message: gsResult.message || 'Unauthorized Apps Script credential.' });
         }
         return res.status(503).json({ status: 'error', code, message: gsResult.message || 'Temporary storage error.' });
       }
@@ -305,89 +340,58 @@ async function startServer() {
     }
   });
 
-  // Manually invoked migration endpoint for legacy live records
+  // Manually invoked migration endpoint (operation: "migrate")
   app.post('/api/admin/migrate-legacy', staffAuth, async (req, res) => {
     try {
       const { dryRun = true } = req.body || {};
       if (!fs.existsSync(LEGACY_JSON_FILE)) {
-        return res.json({ success: true, message: 'No legacy json file found at data/live_inquiries.json.', stats: { imported: 0, skipped: 0, failed: 0 } });
+        return res.json({ success: true, message: 'No legacy json file found at data/live_inquiries.json.', stats: { wouldImport: 0, imported: 0, skipped: 0, conflicted: 0, failed: 0 } });
       }
 
       const content = fs.readFileSync(LEGACY_JSON_FILE, 'utf-8');
       const legacyRecords: InquiryRecord[] = JSON.parse(content);
 
       if (!Array.isArray(legacyRecords) || legacyRecords.length === 0) {
-        return res.json({ success: true, message: 'Legacy file is empty.', stats: { imported: 0, skipped: 0, failed: 0 } });
+        return res.json({ success: true, message: 'Legacy file is empty.', stats: { wouldImport: 0, imported: 0, skipped: 0, conflicted: 0, failed: 0 } });
       }
 
       const appsScriptUrl = process.env.APPS_SCRIPT_WEB_APP_URL;
-      const writeSecret = process.env.APPS_SCRIPT_WRITE_SECRET || process.env.APPS_SCRIPT_SECRET || process.env.WHATSAPP_WEBHOOK_SECRET;
+      const writeSecret = process.env.APPS_SCRIPT_WRITE_SECRET;
 
-      if (!appsScriptUrl || !writeSecret) {
-        return res.status(503).json({ success: false, error: 'Migration requires APPS_SCRIPT_WEB_APP_URL and write secret configured.' });
+      if (!appsScriptUrl || !writeSecret || writeSecret.trim() === '') {
+        return res.status(503).json({ success: false, error: 'Migration requires APPS_SCRIPT_WEB_APP_URL and APPS_SCRIPT_WRITE_SECRET configured.' });
       }
 
-      let imported = 0;
-      let skipped = 0;
-      let failed = 0;
+      const envelope = {
+        operation: 'migrate',
+        credential: writeSecret,
+        payload: {
+          records: legacyRecords,
+          dryRun: !!dryRun
+        }
+      };
 
-      if (dryRun) {
+      const gsResponse = await fetch(appsScriptUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(envelope)
+      });
+
+      if (!gsResponse.ok) {
+        return res.status(502).json({ success: false, error: `Migration storage HTTP error (${gsResponse.status})` });
+      }
+
+      const gsResult = await gsResponse.json();
+      if (gsResult.status === 'success') {
         return res.json({
           success: true,
-          dryRun: true,
-          message: `Dry run completed. Found ${legacyRecords.length} legacy records ready for migration.`,
-          stats: { imported: legacyRecords.length, skipped: 0, failed: 0 }
+          dryRun: !!dryRun,
+          message: dryRun ? 'Migration dry run completed successfully. Zero writes performed.' : 'Live migration completed successfully. Original file left intact.',
+          stats: gsResult.stats
         });
+      } else {
+        return res.status(503).json({ success: false, error: gsResult.message || 'Migration failed in Apps Script.' });
       }
-
-      // Perform actual migration by writing each record via write envelope
-      for (const rec of legacyRecords) {
-        try {
-          const payload = {
-            id: rec.inquiryId,
-            contact: {
-              name: rec.customerName,
-              phone: rec.phoneNumber
-            },
-            source: rec.sourceCampaign,
-            text: rec.messageSummary,
-            assignee: rec.agentAssigned,
-            status: rec.status
-          };
-
-          const envelope = {
-            operation: 'write',
-            credential: writeSecret,
-            payload
-          };
-
-          const gsResponse = await fetch(appsScriptUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(envelope)
-          });
-
-          if (gsResponse.ok) {
-            const resJson = await gsResponse.json();
-            if (resJson.status === 'success' || resJson.status === 'updated') {
-              imported++;
-            } else {
-              skipped++;
-            }
-          } else {
-            failed++;
-          }
-        } catch (migErr) {
-          failed++;
-        }
-      }
-
-      return res.json({
-        success: true,
-        dryRun: false,
-        message: 'Legacy migration completed successfully. Original file left intact.',
-        stats: { imported, skipped, failed }
-      });
     } catch (err: any) {
       console.error('Migration error:', err);
       return res.status(500).json({ success: false, error: err.toString() });

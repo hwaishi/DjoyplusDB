@@ -95,7 +95,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'simulator' | 'webhook' | 'gas' | 'ai' | 'blueprint'>('dashboard');
   const [dataMode, setDataMode] = useState<'demo' | 'live'>('demo');
   const [staffToken, setStaffToken] = useState<string>(localStorage.getItem('sheetflow_staff_token') || '');
-  const [authStatus, setAuthStatus] = useState<{ staffKeySet: boolean; webhookSecretSet: boolean; geminiKeySet: boolean; appsScriptUrlSet: boolean } | null>(null);
+  const [authStatus, setAuthStatus] = useState<{ staffKeySet: boolean; webhookSecretSet: boolean; readSecretSet: boolean; writeSecretSet: boolean; geminiKeySet: boolean; appsScriptUrlSet: boolean } | null>(null);
 
   const [inquiries, setInquiries] = useState<InquiryRecord[]>([]);
   const [loading, setLoading] = useState(false);
@@ -321,7 +321,7 @@ export default function App() {
 
   const generatedGasCode = `/**
  * Google Apps Script Maintained Receiver & Source of Truth for WhatsApp Inquiries
- * Handles secure JSON POST envelopes with operation ("read" or "write") and separate credentials.
+ * Fail-closed authentication with distinct read, write, and migration credentials.
  */
 
 const SPREADSHEET_ID = "${gasSpreadsheetId}";
@@ -337,21 +337,29 @@ function doPost(e) {
     const operation = envelope.operation;
     const credential = envelope.credential;
     
+    if (!operation || !credential || typeof credential !== "string" || credential.trim() === "") {
+      return createJsonResponse({ status: "error", code: "UNAUTHORIZED", message: "Missing or invalid operation/credential." });
+    }
+
     const scriptProps = PropertiesService.getScriptProperties();
     const readSecret = scriptProps.getProperty("APPS_SCRIPT_READ_SECRET");
     const writeSecret = scriptProps.getProperty("APPS_SCRIPT_WRITE_SECRET");
-    const fallbackSecret = scriptProps.getProperty("WHATSAPP_WEBHOOK_SECRET");
     
     if (operation === "read") {
-      if (!readSecret && !fallbackSecret || (credential !== readSecret && credential !== fallbackSecret)) {
+      if (!readSecret || readSecret.trim() === "" || credential !== readSecret) {
         return createJsonResponse({ status: "error", code: "UNAUTHORIZED", message: "Unauthorized read credential." });
       }
       return handleRead();
     } else if (operation === "write") {
-      if (!writeSecret && !fallbackSecret || (credential !== writeSecret && credential !== fallbackSecret)) {
+      if (!writeSecret || writeSecret.trim() === "" || credential !== writeSecret) {
         return createJsonResponse({ status: "error", code: "UNAUTHORIZED", message: "Unauthorized write credential." });
       }
       return handleWrite(envelope.payload);
+    } else if (operation === "migrate") {
+      if (!writeSecret || writeSecret.trim() === "" || credential !== writeSecret) {
+        return createJsonResponse({ status: "error", code: "UNAUTHORIZED", message: "Unauthorized migration credential." });
+      }
+      return handleMigration(envelope.payload);
     } else {
       return createJsonResponse({ status: "error", code: "INVALID_OPERATION", message: "Unknown operation." });
     }
@@ -451,10 +459,17 @@ function handleWrite(payload) {
         const existingAgent = sheet.getRange(existingRowIndex, 8).getValue();
         const existingStatus = sheet.getRange(existingRowIndex, 9).getValue();
         
+        // Update only timestamp and supplied fields. If message or agent omitted, leave existing cells untouched.
         sheet.getRange(existingRowIndex, 2).setValue(timestampStr);
-        sheet.getRange(existingRowIndex, 7).setValue(messageSummary !== null ? safeText(messageSummary) : existingMessage);
-        sheet.getRange(existingRowIndex, 8).setValue(agentAssigned !== null ? safeText(agentAssigned) : existingAgent);
-        sheet.getRange(existingRowIndex, 9).setValue(status !== null ? safeText(status) : existingStatus);
+        if (messageSummary !== null) {
+          sheet.getRange(existingRowIndex, 7).setValue(safeText(messageSummary));
+        }
+        if (agentAssigned !== null) {
+          sheet.getRange(existingRowIndex, 8).setValue(safeText(agentAssigned));
+        }
+        if (status !== null) {
+          sheet.getRange(existingRowIndex, 9).setValue(safeText(status));
+        }
         
         SpreadsheetApp.flush();
         return createJsonResponse({ status: "updated", action: "updated", row: existingRowIndex });
@@ -478,6 +493,128 @@ function handleWrite(payload) {
 
   } catch (error) {
     return createJsonResponse({ status: "error", code: "WRITE_ERROR", message: error.toString() });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function handleMigration(payload) {
+  const records = payload && payload.records;
+  const dryRun = payload && !!payload.dryRun;
+
+  if (!Array.isArray(records)) {
+    return createJsonResponse({ status: "error", code: "INVALID_INPUT", message: "Migration payload must contain an array of records." });
+  }
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    return createJsonResponse({ status: "busy", code: "BUSY", message: "Server busy during migration." });
+  }
+
+  try {
+    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+    const sheet = ss.getSheetByName(SHEET_NAME);
+    if (!sheet) {
+      return createJsonResponse({ status: "error", code: "SHEET_NOT_FOUND", message: "Raw_Inquiries sheet not found." });
+    }
+
+    const data = sheet.getDataRange().getValues();
+    const existingRows = new Set();
+    const existingIds = new Set();
+
+    for (let i = 1; i < data.length; i++) {
+      const rDate = String(data[i][0] instanceof Date ? Utilities.formatDate(data[i][0], "Asia/Kuala_Lumpur", "yyyy-MM-dd") : data[i][0]);
+      const rId = String(data[i][2] || "").replace(/^'/, "");
+      const rPhone = String(data[i][4] || "").replace(/^'/, "");
+      if (rId) existingIds.add(rId);
+      if (rDate && rPhone) {
+        existingRows.add(rDate + "|" + rPhone);
+      }
+    }
+
+    let wouldImport = 0;
+    let imported = 0;
+    let skipped = 0;
+    let conflicted = 0;
+    let failed = 0;
+
+    const inputSeen = new Set();
+    const rowsToAppend = [];
+
+    for (const rec of records) {
+      try {
+        const rDate = String(rec.date || "").trim();
+        const rTimestamp = String(rec.timestamp || "").trim();
+        const rId = String(rec.inquiryId || rec.id || "").trim();
+        const rName = String(rec.customerName || rec.name || "Unknown").trim();
+        const rPhone = String(rec.phoneNumber || rec.phone || "").replace(/[^0-9+]/g, "");
+        const rCampaign = String(rec.sourceCampaign || rec.source || "Organic / Direct").trim();
+        const rMessage = String(rec.messageSummary || rec.text || rec.message || "").trim();
+        const rAgent = String(rec.agentAssigned || rec.assignee || "Unassigned").trim();
+        const rStatus = String(rec.status || "New").trim();
+
+        if (!rDate || !rPhone) {
+          failed++;
+          continue;
+        }
+
+        const inputKey = rDate + "|" + rPhone;
+        const uniqueKey = rId ? rId : inputKey;
+
+        if (inputSeen.has(uniqueKey) || existingIds.has(rId) || existingRows.has(inputKey)) {
+          skipped++;
+          continue;
+        }
+
+        inputSeen.add(uniqueKey);
+        wouldImport++;
+
+        if (!dryRun) {
+          const safeText = function(val) {
+            if (val === null || val === undefined) return "";
+            const s = String(val);
+            if (s.startsWith("=") || s.startsWith("+") || (s.startsWith("0") && s.length > 1)) {
+              return "'" + s;
+            }
+            return s;
+          };
+
+          rowsToAppend.push([
+            rDate,
+            rTimestamp || rDate + " 00:00:00",
+            safeText(rId),
+            safeText(rName),
+            safeText(rPhone),
+            safeText(rCampaign),
+            safeText(rMessage),
+            safeText(rAgent),
+            safeText(rStatus)
+          ]);
+          imported++;
+        }
+      } catch (e) {
+        failed++;
+      }
+    }
+
+    if (!dryRun && rowsToAppend.length > 0) {
+      sheet.getRange(sheet.getLastRow() + 1, 1, rowsToAppend.length, rowsToAppend[0].length).setValues(rowsToAppend);
+      SpreadsheetApp.flush();
+    }
+
+    return createJsonResponse({
+      status: "success",
+      stats: {
+        wouldImport,
+        imported: dryRun ? 0 : imported,
+        skipped,
+        conflicted,
+        failed
+      }
+    });
+
+  } catch (err) {
+    return createJsonResponse({ status: "error", code: "MIGRATE_ERROR", message: err.toString() });
   } finally {
     lock.releaseLock();
   }
@@ -519,7 +656,7 @@ function createJsonResponse(obj) {
                   SheetFlow AI
                 </span>
                 <span className="text-xs bg-emerald-500/10 text-emerald-400 font-medium px-2 py-0.5 rounded-full border border-emerald-500/20">
-                  Google Sheets Source of Truth
+                  Fail-Closed Authentication
                 </span>
               </div>
               <p className="text-xs text-slate-400 hidden sm:block">
@@ -686,7 +823,7 @@ function createJsonResponse(obj) {
                   <div className="flex items-center space-x-3">
                     <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                       <span className="w-2 h-2 rounded-full bg-emerald-400 mr-2 animate-pulse"></span>
-                      Verified Storage Sync
+                      Fail-Closed Storage Sync
                     </span>
                     <button
                       onClick={() => setActiveTab('webhook')}
@@ -698,7 +835,7 @@ function createJsonResponse(obj) {
                   </div>
                 </div>
 
-                {/* KPI Cards (Hidden / shown as — if errorMsg is present) */}
+                {/* KPI Cards */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                   <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm hover:border-slate-700 transition">
                     <div className="flex items-center justify-between">
@@ -1177,7 +1314,7 @@ function createJsonResponse(obj) {
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
                   <div>
                     <h1 className="text-2xl font-bold text-white tracking-tight">Google Apps Script Generator & Migration</h1>
-                    <p className="text-sm text-slate-400">Maintained receiver supporting JSON POST envelopes (<code className="text-emerald-400 font-mono">read</code> & <code className="text-emerald-400 font-mono">write</code>)</p>
+                    <p className="text-sm text-slate-400">Maintained receiver supporting JSON POST envelopes (<code className="text-emerald-400 font-mono">read</code>, <code className="text-emerald-400 font-mono">write</code>, <code className="text-emerald-400 font-mono">migrate</code>)</p>
                   </div>
 
                   <button
@@ -1242,7 +1379,7 @@ function createJsonResponse(obj) {
                         <DatabaseBackup className="w-4 h-4 text-teal-400" />
                         <span>Legacy Live Records Migration Tool</span>
                       </h2>
-                      <p className="text-xs text-slate-400">Safely migrate earlier records from private <code className="text-emerald-400 font-mono">data/live_inquiries.json</code> into Google Sheets</p>
+                      <p className="text-xs text-slate-400">Safely migrate historical records preserving original dates, timestamps, and IDs from private <code className="text-emerald-400 font-mono">data/live_inquiries.json</code></p>
                     </div>
                     <div className="flex space-x-2">
                       <button
@@ -1278,8 +1415,8 @@ function createJsonResponse(obj) {
                 {/* Code Preview Box */}
                 <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-sm">
                   <div className="p-4 border-b border-slate-800 flex items-center justify-between">
-                    <span className="text-xs font-mono text-slate-400">Code.gs (Google Apps Script - JSON POST Envelope Receiver)</span>
-                    <span className="text-xs text-emerald-400 font-mono">Operation Verification + Text Safety</span>
+                    <span className="text-xs font-mono text-slate-400">Code.gs (Google Apps Script - Fail-Closed Authentication & Migration)</span>
+                    <span className="text-xs text-emerald-400 font-mono">Distinct Read/Write Secrets + Status Preservation</span>
                   </div>
                   <div className="p-4 bg-slate-950 overflow-x-auto max-h-96">
                     <pre className="text-xs font-mono text-emerald-300 leading-relaxed">
@@ -1297,9 +1434,9 @@ function createJsonResponse(obj) {
                   <ol className="list-decimal list-inside space-y-2 text-xs text-slate-300">
                     <li>Create a Google Sheet with tabs <strong className="text-white">Raw_Inquiries</strong> and <strong className="text-white">Daily_Summary</strong>. Copy your Spreadsheet ID.</li>
                     <li>Open <strong className="text-white">Extensions &gt; Apps Script</strong>, paste the maintained receiver code above into <code className="text-emerald-400 font-mono">Code.gs</code>.</li>
-                    <li>Go to <strong className="text-white">Project Settings (Gear icon) &gt; Script Properties</strong>, add properties <code className="text-emerald-400 font-mono">APPS_SCRIPT_READ_SECRET</code>, <code className="text-emerald-400 font-mono">APPS_SCRIPT_WRITE_SECRET</code>, and <code className="text-emerald-400 font-mono">WHATSAPP_WEBHOOK_SECRET</code>.</li>
+                    <li>Go to <strong className="text-white">Project Settings (Gear icon) &gt; Script Properties</strong>, add distinct properties <code className="text-emerald-400 font-mono">APPS_SCRIPT_READ_SECRET</code> and <code className="text-emerald-400 font-mono">APPS_SCRIPT_WRITE_SECRET</code>. Do not reuse your CRM webhook secret here.</li>
                     <li>Click <strong className="text-white">Deploy &gt; New deployment</strong> &gt; Web app (Execute as: <strong className="text-white">Me</strong>, Who has access: <strong className="text-white">Anyone</strong>). Copy the Web App URL into <code className="text-emerald-400 font-mono">APPS_SCRIPT_WEB_APP_URL</code> in your server environment.</li>
-                    <li>Configure your WhatsApp CRM webhook to send to your Express backend (<code className="text-emerald-400 font-mono">POST /api/webhook/whatsapp</code>) with header <code className="text-emerald-400 font-mono">X-Webhook-Secret: YOUR_SECRET</code>.</li>
+                    <li>Configure your WhatsApp CRM webhook to send to your Express backend (<code className="text-emerald-400 font-mono">POST /api/webhook/whatsapp</code>) with header <code className="text-emerald-400 font-mono">X-Webhook-Secret: YOUR_WHATSAPP_WEBHOOK_SECRET</code>.</li>
                   </ol>
                 </div>
               </div>
@@ -1415,16 +1552,16 @@ function createJsonResponse(obj) {
 
                 <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 sm:p-8 space-y-6 text-slate-300 leading-relaxed text-sm">
                   <div className="border-b border-slate-800 pb-4">
-                    <h2 className="text-xl font-bold text-white mb-2">1. Separate CRM Write Access from Dashboard Read Access</h2>
+                    <h2 className="text-xl font-bold text-white mb-2">1. Fail-Closed Authentication & Distinct Secrets</h2>
                     <p className="text-slate-400">
-                      CRM webhooks arrive at <code className="text-emerald-400 font-mono">POST /api/webhook/whatsapp</code> authenticated via header <code className="text-emerald-400 font-mono">X-Webhook-Secret</code>. Dashboard reads arrive at Express and query Google Sheets using a secure JSON POST envelope ({`{ operation: "read", credential: ... }`}) sent to Apps Script. The CRM credential can never read records.
+                      Express uses <code className="text-emerald-400 font-mono">APPS_SCRIPT_READ_SECRET</code> exclusively for reads and <code className="text-emerald-400 font-mono">APPS_SCRIPT_WRITE_SECRET</code> exclusively for writes. The CRM webhook uses <code className="text-emerald-400 font-mono">WHATSAPP_WEBHOOK_SECRET</code> via header <code className="text-emerald-400 font-mono">X-Webhook-Secret</code>. Apps Script fails closed if credentials do not match exactly.
                     </p>
                   </div>
 
                   <div className="border-b border-slate-800 pb-4">
                     <h2 className="text-xl font-bold text-white mb-2">2. Status-Only Updates & Field Preservation</h2>
                     <p className="text-slate-400">
-                      Follow-up updates that only supply status leave earlier message and agent cells untouched. Incoming text and phone numbers are written as literal text (preventing formula injection for messages starting with `=`).
+                      Follow-up updates that only supply status leave earlier message and agent cells untouched (preserving messages starting with `=`). Incoming text and phone numbers are written as literal text.
                     </p>
                   </div>
 
@@ -1446,7 +1583,7 @@ function createJsonResponse(obj) {
 
       {/* Footer */}
       <footer className="bg-slate-900 border-t border-slate-800 py-4 text-center text-xs text-slate-500">
-        <p>WhatsApp Sheets Automation Hub • Google Sheets Source of Truth Edition</p>
+        <p>WhatsApp Sheets Automation Hub • Fail-Closed Authentication Edition</p>
       </footer>
     </div>
   );

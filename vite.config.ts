@@ -24,8 +24,8 @@ export default defineConfig(() => {
           const distSrcAssets = path.resolve(distDir, 'src/assets');
           const distAssets = path.resolve(distDir, 'assets');
           if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
-            fs.cpSync(srcAssets, distSrcAssets, {recursive: true, force: true});
-            fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
+            fs.cpSync(srcAssets, distSrcAssets, {recursive: true, force: false});
+            fs.cpSync(srcAssets, distAssets, {recursive: true, force: false});
           }
         },
       },
